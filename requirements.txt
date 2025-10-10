@@ -1,0 +1,77 @@
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Real-time Communication
+livekit==1.0.13
+livekit-api==1.0.6
+livekit-protocol==1.0.7
+websockets==12.0
+
+# AI Services
+openai>=1.6.1,<2.0.0  # Required by langchain-openai
+anthropic>=0.16.0,<1.0.0  # Required by langchain-anthropic
+elevenlabs==0.2.26
+openai-whisper==20231117
+
+# LangGraph and LangChain
+langgraph==0.0.20
+langchain==0.1.0
+langchain-openai==0.0.2
+langchain-anthropic==0.1.0
+langchain-core>=0.1.8,<0.2.0  # Required by langgraph 0.0.20
+
+# AWS Services
+boto3==1.34.0
+botocore==1.34.0
+
+# Database
+dynamodb-json==1.3.0
+
+# HTTP & Async
+httpx==0.25.2
+aiohttp==3.9.1
+asyncio-mqtt==0.13.0
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# External Integrations
+google-auth==2.25.2
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.110.0
+slack-sdk==3.26.1
+
+# Meeting Agent Dependencies
+selenium==4.15.2
+webdriver-manager==4.0.1
+# pyzoomus==1.0.0  # Package not available - using mock implementation in zoom_client.py
+msal==1.24.1
+apscheduler==3.10.4
+
+# Data Processing
+numpy>=1.26,<2.0.0
+scipy==1.11.4
+librosa==0.10.1
+soundfile==0.12.1
+
+# Monitoring & Logging
+structlog==23.2.0
+prometheus-client==0.19.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-mock==3.12.0
+moto[boto3]==4.2.14
+
+# Development
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.7.1
