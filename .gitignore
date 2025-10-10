@@ -77,6 +77,9 @@ infra/terraform/.terraform.lock.hcl
 # AWS
 .aws/
 
+# ECS Task Definition (environment-specific)
+ecs-task-def.json
+
 # All.txt and command.md (generated files)
 all.txt
 command.md
