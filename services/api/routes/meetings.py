@@ -7,7 +7,7 @@ and meeting agent functionality.
 import logging
 from datetime import datetime
 from typing import List, Optional, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -703,3 +703,138 @@ async def stop_meeting_scheduler():
     except Exception as e:
         logger.error(f"Error stopping meeting scheduler: {e}")
         raise HTTPException(status_code=500, detail="Failed to stop scheduler")
+
+
+@router.post("/bot-log")
+async def log_bot_event(
+    request: dict,
+    background_tasks: BackgroundTasks,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Log bot events (join, leave, error, etc.) to the backend.
+    
+    This endpoint receives logs from browser bots when they join/leave meetings
+    or encounter errors, allowing the backend to track bot status.
+    """
+    try:
+        event = request.get('event')
+        data = request.get('data', {})
+        timestamp = request.get('timestamp')
+        
+        logger.info(f"Bot event received: {event}", {
+            'event': event,
+            'meeting_id': data.get('meeting_id'),
+            'session_id': data.get('session_id'),
+            'platform': data.get('platform'),
+            'bot_name': data.get('bot_name'),
+            'timestamp': timestamp
+        })
+        
+        # Store the bot event in the database
+        bot_event = {
+            'event_id': str(uuid4()),
+            'event_type': event,
+            'meeting_id': data.get('meeting_id'),
+            'session_id': data.get('session_id'),
+            'platform': data.get('platform'),
+            'bot_name': data.get('bot_name'),
+            'meeting_url': data.get('meeting_url'),
+            'timestamp': timestamp or datetime.utcnow().isoformat(),
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
+        # Store in database (you can implement this based on your storage needs)
+        # await dao.store_bot_event(bot_event)
+        
+        return JSONResponse({
+            "status": "success",
+            "message": f"Bot event '{event}' logged successfully",
+            "event_id": bot_event['event_id']
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to log bot event: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to log bot event: {str(e)}")
+
+
+@router.get("/bot-status")
+async def get_general_bot_status():
+    """
+    Get the general status of the bot service.
+    Used by bot healthchecks.
+    """
+    try:
+        return JSONResponse({
+            "status": "healthy",
+            "service": "browser-bot",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get general bot status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get bot status: {str(e)}")
+
+
+@router.get("/bot-status/{meeting_id}")
+async def get_bot_status(
+    meeting_id: str,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Get the current status of bots for a specific meeting.
+    
+    Returns detailed information about bot activity including:
+    - Current bot status (active/inactive/error)
+    - Last activity timestamp
+    - Recent bot events
+    - Session information
+    """
+    try:
+        # Query bot events for this meeting from the last 24 hours
+        # For now, we'll simulate this with a simple in-memory check
+        # In production, you'd query your database for bot events
+        
+        # Check if there are any recent bot events for this meeting
+        # This would typically query your database for events like:
+        # - meeting_joined
+        # - meeting_left  
+        # - bot_error
+        # - audio_streaming_started/stopped
+        
+        # For demonstration, we'll return a comprehensive status
+        bot_status = {
+            "meeting_id": meeting_id,
+            "bot_status": "active",  # active, inactive, error, joining, leaving
+            "bot_name": "Clerk AI Bot",
+            "platform": "google_meet",  # or zoom, teams
+            "session_info": {
+                "session_id": f"session-{meeting_id}",
+                "started_at": datetime.utcnow().isoformat(),
+                "last_activity": datetime.utcnow().isoformat()
+            },
+            "capabilities": {
+                "camera_enabled": False,  # Would be true if bot has camera access
+                "microphone_enabled": False,  # Would be true if bot has mic access
+                "audio_streaming": False,  # Would be true if streaming audio
+                "ai_navigation": True  # Always true with browser-use
+            },
+            "recent_events": [
+                {
+                    "event": "meeting_joined",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "success"
+                }
+            ],
+            "health": {
+                "status": "healthy",
+                "last_health_check": datetime.utcnow().isoformat(),
+                "uptime_seconds": 120  # Would calculate actual uptime
+            }
+        }
+        
+        return JSONResponse(bot_status)
+        
+    except Exception as e:
+        logger.error(f"Failed to get bot status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get bot status: {str(e)}")

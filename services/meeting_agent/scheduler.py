@@ -9,6 +9,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import json
+import boto3
+import docker
+from uuid import uuid4
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -39,6 +42,20 @@ class MeetingScheduler:
         self.config = MeetingConfig()
         self.is_running = False
         
+        # Browser bot orchestration
+        self.browser_bot_enabled = getattr(settings, 'browser_bot_enabled', True)
+        self.bot_image = getattr(settings, 'bot_image', 'clerk-browser-bot')
+        self.bot_container_cpu = getattr(settings, 'bot_container_cpu', '1024')
+        self.bot_container_memory = getattr(settings, 'bot_container_memory', '2048')
+        self.bot_join_timeout_sec = getattr(settings, 'bot_join_timeout_sec', 60)
+        self.max_concurrent_bots = getattr(settings, 'max_concurrent_bots', 5)
+        
+        # Initialize container orchestration clients
+        self.docker_client = None
+        self.ecs_client = None
+        self.sqs_client = None
+        self.active_bot_containers: Dict[str, Dict[str, Any]] = {}
+        
     async def initialize(self) -> None:
         """Initialize the meeting scheduler."""
         logger.info("Initializing meeting scheduler...")
@@ -60,6 +77,10 @@ class MeetingScheduler:
             # Initialize clients
             for client in self.meeting_clients.values():
                 await client.initialize()
+            
+            # Initialize browser bot orchestration
+            if self.browser_bot_enabled:
+                await self._initialize_browser_bot_orchestration()
             
             logger.info("Meeting scheduler initialized successfully")
             
@@ -258,29 +279,53 @@ class MeetingScheduler:
         try:
             logger.info(f"Joining meeting: {meeting.title}")
             
-            # Get appropriate client
-            client = self.meeting_clients.get(meeting.platform)
-            if not client:
-                logger.error(f"No client available for platform: {meeting.platform}")
-                return
-            
             # Update meeting status
             meeting.status = MeetingStatus.JOINING
             meeting.join_attempts += 1
             meeting.last_join_attempt = datetime.utcnow()
             
-            # Join meeting
-            join_response = await client.join_meeting(meeting)
+            # Launch browser bot if enabled
+            bot_launched = False
+            if self.browser_bot_enabled and meeting.meeting_url:
+                try:
+                    bot_launched = await self.launch_browser_bot(
+                        meeting_id=str(meeting.id),
+                        platform=meeting.platform.value,
+                        meeting_url=meeting.meeting_url,
+                        bot_name=getattr(settings, 'ai_email', 'Clerk AI Bot')
+                    )
+                    if bot_launched:
+                        logger.info(f"Browser bot launched for meeting: {meeting.title}")
+                    else:
+                        logger.warning(f"Failed to launch browser bot for meeting: {meeting.title}")
+                except Exception as e:
+                    logger.error(f"Error launching browser bot: {e}")
             
-            if join_response.success:
+            # Get appropriate client for traditional joining (if needed)
+            client = self.meeting_clients.get(meeting.platform)
+            if client:
+                # Join meeting using traditional client
+                join_response = await client.join_meeting(meeting)
+                
+                if join_response.success:
+                    meeting.status = MeetingStatus.ACTIVE
+                    meeting.joined_at = datetime.utcnow()
+                    self.active_meetings[meeting.id] = meeting
+                    logger.info(f"Successfully joined meeting: {meeting.title}")
+                else:
+                    meeting.status = MeetingStatus.FAILED
+                    meeting.error_message = join_response.error_message
+                    logger.error(f"Failed to join meeting: {meeting.title} - {join_response.error_message}")
+            elif bot_launched:
+                # If only browser bot is used and it launched successfully
                 meeting.status = MeetingStatus.ACTIVE
                 meeting.joined_at = datetime.utcnow()
                 self.active_meetings[meeting.id] = meeting
-                logger.info(f"Successfully joined meeting: {meeting.title}")
+                logger.info(f"Successfully joined meeting with browser bot: {meeting.title}")
             else:
                 meeting.status = MeetingStatus.FAILED
-                meeting.error_message = join_response.error_message
-                logger.error(f"Failed to join meeting: {meeting.title} - {join_response.error_message}")
+                meeting.error_message = "No client available and browser bot failed to launch"
+                logger.error(f"No client available for platform: {meeting.platform}")
             
         except Exception as e:
             logger.error(f"Error joining meeting: {e}")
@@ -303,6 +348,14 @@ class MeetingScheduler:
         """Leave a meeting."""
         try:
             logger.info(f"Leaving meeting: {meeting.title}")
+            
+            # Stop browser bot if active
+            if str(meeting.id) in self.active_bot_containers:
+                try:
+                    await self.stop_browser_bot(str(meeting.id))
+                    logger.info(f"Stopped browser bot for meeting: {meeting.title}")
+                except Exception as e:
+                    logger.error(f"Error stopping browser bot: {e}")
             
             # Get appropriate client
             client = self.meeting_clients.get(meeting.platform)
@@ -336,12 +389,255 @@ class MeetingScheduler:
             logger.error(f"Error force joining meeting: {e}")
             return False
     
+    async def _initialize_browser_bot_orchestration(self) -> None:
+        """Initialize browser bot orchestration clients."""
+        try:
+            # Initialize Docker client for local development
+            try:
+                self.docker_client = docker.from_env()
+                logger.info("Docker client initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Docker client: {e}")
+            
+            # Initialize AWS clients for production
+            try:
+                self.ecs_client = boto3.client('ecs')
+                self.sqs_client = boto3.client('sqs')
+                logger.info("AWS clients initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize AWS clients: {e}")
+            
+            logger.info("Browser bot orchestration initialized")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize browser bot orchestration: {e}")
+            raise
+    
+    async def launch_browser_bot(self, meeting_id: str, platform: str, meeting_url: str, bot_name: str = None) -> bool:
+        """Launch a browser bot container for a meeting."""
+        try:
+            logger.info(f"Launching browser bot for meeting: {meeting_id}")
+            
+            if not self.browser_bot_enabled:
+                logger.warning("Browser bot is disabled")
+                return False
+            
+            # Check if we're at capacity
+            if len(self.active_bot_containers) >= self.max_concurrent_bots:
+                logger.warning(f"Maximum concurrent bots ({self.max_concurrent_bots}) reached")
+                return False
+            
+            # Generate unique session ID
+            session_id = str(uuid4())
+            
+            # Prepare environment variables
+            env_vars = {
+                'MEETING_URL': meeting_url,
+                'BOT_NAME': bot_name or 'Clerk AI Bot',
+                'PLATFORM': platform,
+                'MEETING_ID': meeting_id,
+                'SESSION_ID': session_id,
+                'RT_GATEWAY_URL': getattr(settings, 'rt_gateway_url', 'ws://localhost:8001'),
+                'API_BASE_URL': getattr(settings, 'api_base_url', 'http://localhost:8000'),
+                'JOIN_TIMEOUT_SEC': str(self.bot_join_timeout_sec),
+                'AUDIO_SAMPLE_RATE': '16000',
+                'AUDIO_CHANNELS': '1',
+                'LOG_LEVEL': 'info'
+            }
+            
+            # Try Docker first (local development)
+            if self.docker_client:
+                success = await self._launch_docker_bot(meeting_id, session_id, env_vars)
+                if success:
+                    return True
+            
+            # Fall back to AWS ECS (production)
+            if self.ecs_client:
+                success = await self._launch_ecs_bot(meeting_id, session_id, env_vars)
+                if success:
+                    return True
+            
+            logger.error("Failed to launch browser bot with any method")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error launching browser bot: {e}")
+            return False
+    
+    async def _launch_docker_bot(self, meeting_id: str, session_id: str, env_vars: Dict[str, str]) -> bool:
+        """Launch browser bot using Docker."""
+        try:
+            logger.info(f"Launching Docker bot for meeting: {meeting_id}")
+            
+            # Create container name
+            container_name = f"clerk-bot-{meeting_id}-{session_id[:8]}"
+            
+            # Run container
+            container = self.docker_client.containers.run(
+                image=self.bot_image,
+                name=container_name,
+                environment=env_vars,
+                detach=True,
+                remove=True,
+                network_mode='host',
+                shm_size='2g',
+                mem_limit=f'{self.bot_container_memory}m',
+                cpu_quota=int(self.bot_container_cpu),
+                security_opt=['seccomp:unconfined'],
+                cap_add=['SYS_ADMIN'],
+                devices=['/dev/snd:/dev/snd'],
+                volumes={
+                    '/dev/shm': {'bind': '/dev/shm', 'mode': 'rw'},
+                    '/tmp/.X11-unix': {'bind': '/tmp/.X11-unix', 'mode': 'rw'}
+                }
+            )
+            
+            # Store container info
+            self.active_bot_containers[meeting_id] = {
+                'container_id': container.id,
+                'container_name': container_name,
+                'session_id': session_id,
+                'started_at': datetime.utcnow(),
+                'platform': env_vars['PLATFORM']
+            }
+            
+            logger.info(f"Docker bot launched successfully: {container_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error launching Docker bot: {e}")
+            return False
+    
+    async def _launch_ecs_bot(self, meeting_id: str, session_id: str, env_vars: Dict[str, str]) -> bool:
+        """Launch browser bot using AWS ECS."""
+        try:
+            logger.info(f"Launching ECS bot for meeting: {meeting_id}")
+            
+            # Prepare task definition overrides
+            overrides = {
+                'containerOverrides': [
+                    {
+                        'name': 'browser-bot',
+                        'environment': [
+                            {'name': k, 'value': v} for k, v in env_vars.items()
+                        ]
+                    }
+                ]
+            }
+            
+            # Run ECS task
+            response = self.ecs_client.run_task(
+                cluster=getattr(settings, 'ecs_cluster_name', 'clerk-cluster'),
+                taskDefinition=getattr(settings, 'ecs_task_definition', 'clerk-browser-bot'),
+                launchType='FARGATE',
+                networkConfiguration={
+                    'awsvpcConfiguration': {
+                        'subnets': getattr(settings, 'ecs_subnet_ids', []),
+                        'securityGroups': getattr(settings, 'ecs_security_group_ids', []),
+                        'assignPublicIp': 'DISABLED'
+                    }
+                },
+                overrides=overrides,
+                tags=[
+                    {'key': 'MeetingId', 'value': meeting_id},
+                    {'key': 'SessionId', 'value': session_id},
+                    {'key': 'Platform', 'value': env_vars['PLATFORM']}
+                ]
+            )
+            
+            if response['tasks']:
+                task_arn = response['tasks'][0]['taskArn']
+                
+                # Store task info
+                self.active_bot_containers[meeting_id] = {
+                    'task_arn': task_arn,
+                    'session_id': session_id,
+                    'started_at': datetime.utcnow(),
+                    'platform': env_vars['PLATFORM']
+                }
+                
+                logger.info(f"ECS bot launched successfully: {task_arn}")
+                return True
+            else:
+                logger.error("No tasks created in ECS response")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error launching ECS bot: {e}")
+            return False
+    
+    async def stop_browser_bot(self, meeting_id: str) -> bool:
+        """Stop a browser bot container."""
+        try:
+            logger.info(f"Stopping browser bot for meeting: {meeting_id}")
+            
+            if meeting_id not in self.active_bot_containers:
+                logger.warning(f"No active bot found for meeting: {meeting_id}")
+                return False
+            
+            bot_info = self.active_bot_containers[meeting_id]
+            success = False
+            
+            # Try Docker first
+            if 'container_id' in bot_info and self.docker_client:
+                try:
+                    container = self.docker_client.containers.get(bot_info['container_id'])
+                    container.stop(timeout=10)
+                    success = True
+                    logger.info(f"Docker bot stopped: {bot_info['container_name']}")
+                except Exception as e:
+                    logger.error(f"Error stopping Docker bot: {e}")
+            
+            # Try ECS
+            if 'task_arn' in bot_info and self.ecs_client:
+                try:
+                    self.ecs_client.stop_task(
+                        cluster=getattr(settings, 'ecs_cluster_name', 'clerk-cluster'),
+                        task=bot_info['task_arn'],
+                        reason='Meeting ended'
+                    )
+                    success = True
+                    logger.info(f"ECS bot stopped: {bot_info['task_arn']}")
+                except Exception as e:
+                    logger.error(f"Error stopping ECS bot: {e}")
+            
+            # Remove from active containers
+            del self.active_bot_containers[meeting_id]
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error stopping browser bot: {e}")
+            return False
+    
+    async def get_active_bot_containers(self) -> Dict[str, Dict[str, Any]]:
+        """Get information about active bot containers."""
+        return self.active_bot_containers.copy()
+    
+    async def cleanup_bot_containers(self) -> None:
+        """Cleanup all active bot containers."""
+        logger.info("Cleaning up bot containers...")
+        
+        try:
+            for meeting_id in list(self.active_bot_containers.keys()):
+                await self.stop_browser_bot(meeting_id)
+            
+            logger.info("Bot containers cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during bot containers cleanup: {e}")
+
     async def cleanup(self) -> None:
         """Cleanup scheduler resources."""
         logger.info("Cleaning up meeting scheduler...")
         
         try:
             await self.stop()
+            
+            # Cleanup bot containers
+            if self.browser_bot_enabled:
+                await self.cleanup_bot_containers()
+            
             logger.info("Meeting scheduler cleanup completed")
             
         except Exception as e:

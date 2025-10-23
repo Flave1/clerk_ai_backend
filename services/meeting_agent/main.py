@@ -119,17 +119,36 @@ class MeetingAgentService:
         logger.info(f"Processing meeting: {meeting.title}")
         
         try:
+            # Launch browser bot if enabled and meeting URL is available
+            bot_launched = False
+            if meeting.meeting_url and hasattr(self.scheduler, 'browser_bot_enabled') and self.scheduler.browser_bot_enabled:
+                try:
+                    bot_launched = await self.launch_browser_bot(
+                        meeting_id=str(meeting.id),
+                        platform=meeting.platform.value,
+                        meeting_url=meeting.meeting_url,
+                        bot_name=getattr(settings, 'ai_email', 'Clerk AI Bot')
+                    )
+                    if bot_launched:
+                        logger.info(f"Browser bot launched for meeting: {meeting.title}")
+                    else:
+                        logger.warning(f"Failed to launch browser bot for meeting: {meeting.title}")
+                except Exception as e:
+                    logger.error(f"Error launching browser bot: {e}")
+            
             # Get appropriate client from scheduler
             client = self.scheduler.meeting_clients.get(meeting.platform)
-            if not client:
+            if not client and not bot_launched:
                 logger.error(f"No client available for platform: {meeting.platform}")
                 return
             
-            # Join meeting
-            join_response = await client.join_meeting(meeting)
-            if not join_response.success:
-                logger.error(f"Failed to join meeting: {join_response.error_message}")
-                return
+            # Join meeting using traditional client if available
+            if client:
+                join_response = await client.join_meeting(meeting)
+                if not join_response.success:
+                    logger.error(f"Failed to join meeting: {join_response.error_message}")
+                    if not bot_launched:
+                        return
             
             # Start meeting process
             await self._start_meeting_process(meeting, client)
@@ -287,6 +306,66 @@ class MeetingAgentService:
             logger.error(f"Error getting service status: {e}")
             return {'error': str(e)}
     
+    async def launch_browser_bot(self, meeting_id: str, platform: str, meeting_url: str, bot_name: str = None) -> bool:
+        """Launch a browser bot container for a meeting."""
+        try:
+            logger.info(f"Launching browser bot for meeting: {meeting_id}")
+            
+            # Delegate to scheduler's browser bot functionality
+            if hasattr(self.scheduler, 'launch_browser_bot'):
+                return await self.scheduler.launch_browser_bot(
+                    meeting_id=meeting_id,
+                    platform=platform,
+                    meeting_url=meeting_url,
+                    bot_name=bot_name
+                )
+            else:
+                logger.warning("Browser bot functionality not available in scheduler")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error launching browser bot: {e}")
+            return False
+    
+    async def stop_browser_bot(self, meeting_id: str) -> bool:
+        """Stop a browser bot container."""
+        try:
+            logger.info(f"Stopping browser bot for meeting: {meeting_id}")
+            
+            # Delegate to scheduler's browser bot functionality
+            if hasattr(self.scheduler, 'stop_browser_bot'):
+                return await self.scheduler.stop_browser_bot(meeting_id)
+            else:
+                logger.warning("Browser bot functionality not available in scheduler")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error stopping browser bot: {e}")
+            return False
+    
+    async def get_browser_bot_status(self) -> Dict[str, Any]:
+        """Get status of browser bot containers."""
+        try:
+            if hasattr(self.scheduler, 'get_active_bot_containers'):
+                active_containers = await self.scheduler.get_active_bot_containers()
+                return {
+                    'active_bots_count': len(active_containers),
+                    'active_bots': active_containers,
+                    'browser_bot_enabled': getattr(self.scheduler, 'browser_bot_enabled', False),
+                    'max_concurrent_bots': getattr(self.scheduler, 'max_concurrent_bots', 5)
+                }
+            else:
+                return {
+                    'active_bots_count': 0,
+                    'active_bots': {},
+                    'browser_bot_enabled': False,
+                    'max_concurrent_bots': 0
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting browser bot status: {e}")
+            return {'error': str(e)}
+
     async def cleanup(self) -> None:
         """Cleanup meeting agent service resources."""
         logger.info("Cleaning up Meeting Agent Service...")
