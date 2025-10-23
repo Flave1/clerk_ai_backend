@@ -52,7 +52,9 @@ class RecallClient:
             bot_data = {
                 "meeting_url": meeting.meeting_url,
                 "bot_name": "Clerk AI Assistant",
-                "recording": False,
+                "recording": True,
+                "transcription": True,
+                "summary": True,
                 "automatic_leave": {
                     "waiting_room_timeout": 600,  # 10 minutes
                     "noone_joined_timeout": 600

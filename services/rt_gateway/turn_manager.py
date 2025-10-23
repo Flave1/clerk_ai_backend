@@ -26,6 +26,18 @@ class TurnManager:
         self.conversations: Dict[str, Conversation] = {}
         self.conversation_turns: Dict[str, List[Turn]] = {}
         self.conversation_state: Dict[str, str] = {}  # conversation_id -> state
+        self.conversation_websockets: Dict[str, any] = {}  # conversation_id -> websocket
+
+    def register_websocket(self, conversation_id: str, websocket):
+        """Register a WebSocket connection for a conversation."""
+        self.conversation_websockets[conversation_id] = websocket
+        logger.info(f"Registered WebSocket for conversation {conversation_id}")
+
+    def unregister_websocket(self, conversation_id: str):
+        """Unregister a WebSocket connection for a conversation."""
+        if conversation_id in self.conversation_websockets:
+            del self.conversation_websockets[conversation_id]
+            logger.info(f"Unregistered WebSocket for conversation {conversation_id}")
 
     async def start_conversation(self, room_id: str, user_id: str) -> Conversation:
         """Start a new conversation."""
@@ -97,6 +109,12 @@ class TurnManager:
                     del self.conversation_turns[conversation_id]
                 if conversation_id in self.conversation_state:
                     del self.conversation_state[conversation_id]
+                if conversation_id in self.conversation_websockets:
+                    del self.conversation_websockets[conversation_id]
+
+                # Cleanup audio buffers in LiveKit bridge
+                if hasattr(self, 'livekit_bridge') and self.livekit_bridge:
+                    await self.livekit_bridge.cleanup_conversation(conversation_id)
 
                 # Update conversation in database
                 await self._update_conversation_in_db(conversation)
@@ -240,7 +258,10 @@ class TurnManager:
                 # Update conversation state
                 await self._update_conversation_state(conversation_id, turn, ai_turn)
 
-                # Return only text response - audio streaming removed
+                # Send TTS response
+                await self._send_tts_response(conversation, response.content)
+
+                # Return text response
                 return response.content
 
         except Exception as e:
@@ -353,10 +374,16 @@ class TurnManager:
             # Generate TTS audio using the TTS service
             from shared.schemas import TTSRequest
             
+            # Get the latest turn number for this conversation
+            conversation_id = str(conversation.id)
+            turns = self.conversation_turns.get(conversation_id, [])
+            turn_number = len(turns) + 1 if turns else 1
+            
             tts_request = TTSRequest(
                 text=text,
                 voice_id="default",
-                language="en"
+                conversation_id=conversation.id,
+                turn_number=turn_number
             )
             
             tts_response = await self.tts_service.synthesize(tts_request)
@@ -364,7 +391,18 @@ class TurnManager:
             if tts_response and tts_response.audio_data:
                 logger.info(f"Generated TTS audio: {len(tts_response.audio_data)} bytes")
                 
-                # Send audio to LiveKit room if available
+                # Send audio to WebSocket if available
+                conversation_id = str(conversation.id)
+                websocket = self.conversation_websockets.get(conversation_id)
+                
+                if websocket:
+                    try:
+                        await self.livekit_bridge.send_tts_audio_to_websocket(websocket, tts_response.audio_data)
+                        logger.info(f"Sent TTS audio to WebSocket for conversation {conversation_id}")
+                    except Exception as ws_error:
+                        logger.error(f"Failed to send TTS to WebSocket: {ws_error}")
+                
+                # Also send to LiveKit room if available
                 if hasattr(self, 'livekit_bridge') and self.livekit_bridge:
                     room_id = conversation.room_id or "default"
                     await self.livekit_bridge.send_tts_audio(room_id, tts_response.audio_data)
@@ -375,6 +413,38 @@ class TurnManager:
             
         except Exception as e:
             logger.error(f"Failed to send TTS response: {e}")
+
+    async def load_existing_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Load an existing conversation from the database."""
+        try:
+            # Import DAO directly to avoid circular imports
+            from services.api.dao import DynamoDBDAO
+            
+            # Create a DAO instance and load conversation
+            dao = DynamoDBDAO()
+            await dao.initialize()
+            conversation = await dao.get_conversation(conversation_id)
+            
+            if conversation:
+                # Load conversation into memory
+                self.conversations[str(conversation.id)] = conversation
+                
+                # Load existing turns for this conversation
+                turns = await dao.get_conversation_turns(conversation_id)
+                self.conversation_turns[str(conversation.id)] = turns
+                
+                # Set conversation state
+                self.conversation_state[str(conversation.id)] = "active"
+                
+                logger.info(f"Loaded existing conversation {conversation_id} with {len(turns)} turns")
+                return conversation
+            else:
+                logger.warning(f"Conversation {conversation_id} not found in database")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to load existing conversation {conversation_id}: {e}")
+            return None
 
     async def _save_conversation_to_db(self, conversation: Conversation):
         """Save conversation to database directly."""

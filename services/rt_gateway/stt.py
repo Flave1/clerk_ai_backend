@@ -210,9 +210,59 @@ class STTService:
             # Final fallback: return raw data
             return audio_data
 
-    async def transcribe_streaming(self, audio_stream, language: str = "en"):
+    async def transcribe_streaming(self, audio_chunks, language: str = "en"):
         """Streaming transcription for real-time processing."""
-        # This would implement streaming transcription
-        # For now, return a placeholder
-        logger.info("Streaming transcription not yet implemented")
-        pass
+        try:
+            # Buffer for accumulating audio chunks
+            audio_buffer = b""
+            chunk_count = 0
+            
+            async for audio_chunk in audio_chunks:
+                audio_buffer += audio_chunk
+                chunk_count += 1
+                
+                # Process every 5 chunks or when buffer reaches certain size
+                if chunk_count >= 5 or len(audio_buffer) >= 16000:  # ~1 second at 16kHz
+                    try:
+                        # Create STT request for buffered audio
+                        request = STTRequest(
+                            audio_data=audio_buffer,
+                            conversation_id="streaming",
+                            turn_number=chunk_count,
+                            language=language
+                        )
+                        
+                        # Transcribe the buffered audio
+                        response = await self.transcribe(request)
+                        
+                        if response and response.text.strip():
+                            yield response
+                        
+                        # Reset buffer
+                        audio_buffer = b""
+                        chunk_count = 0
+                        
+                    except Exception as e:
+                        logger.error(f"Streaming transcription error: {e}")
+                        continue
+            
+            # Process any remaining audio in buffer
+            if audio_buffer:
+                try:
+                    request = STTRequest(
+                        audio_data=audio_buffer,
+                        conversation_id="streaming",
+                        turn_number=chunk_count,
+                        language=language
+                    )
+                    
+                    response = await self.transcribe(request)
+                    if response and response.text.strip():
+                        yield response
+                        
+                except Exception as e:
+                    logger.error(f"Final streaming transcription error: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Streaming transcription failed: {e}")
+            raise

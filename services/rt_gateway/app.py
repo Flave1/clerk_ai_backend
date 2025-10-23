@@ -317,22 +317,54 @@ async def generate_response(request: LLMRequest) -> LLMResponse:
 async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
     """WebSocket endpoint for real-time communication."""
     await websocket.accept()
+    
+    # Load existing conversation if it exists
+    conversation = await turn_manager.load_existing_conversation(conversation_id)
+    if not conversation:
+        logger.error(f"Conversation {conversation_id} not found in database")
+        await websocket.close(code=1000, reason="Conversation not found")
+        return
+    
+    logger.info(f"Successfully loaded conversation {conversation_id} for WebSocket")
+    
+    # Register WebSocket with turn manager for TTS audio streaming
+    turn_manager.register_websocket(conversation_id, websocket)
 
     try:
         while True:
-            # Only handle text messages - audio streaming removed
             try:
-                data = await websocket.receive_text()
-                logger.info(f"Received text message: {data}")
-                
-                # Process text message through turn manager
-                await process_text_message(conversation_id, data, websocket)
+                # Try to receive text message first
+                try:
+                    data = await websocket.receive_text()
+                    
+                    # Handle ping/pong for keepalive
+                    if data == "ping":
+                        await websocket.send_text("pong")
+                        continue
+                    
+                    logger.info(f"Received text message: {data}")
+                    
+                    # Process text message through turn manager
+                    await process_text_message(conversation_id, data, websocket)
+                    
+                except Exception:
+                    # If text fails, try to receive binary data
+                    try:
+                        binary_data = await websocket.receive_bytes()
+                        logger.info(f"Received binary audio data: {len(binary_data)} bytes")
+                        
+                        # Audio processing disabled - using frontend STT instead
+                        await websocket.send_text("Audio received (STT handled on frontend)")
+                        
+                    except Exception as binary_error:
+                        logger.error(f"Failed to receive binary data: {binary_error}")
+                        break
                 
             except WebSocketDisconnect:
                 logger.info(f"WebSocket disconnected for conversation {conversation_id}")
                 break
             except Exception as e:
-                logger.error(f"Failed to receive text message: {e}")
+                logger.error(f"Failed to receive message: {e}")
                 break
 
     except WebSocketDisconnect:
@@ -340,6 +372,9 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str):
     except Exception as e:
         logger.error(f"WebSocket error for conversation {conversation_id}: {e}")
         await websocket.close()
+    finally:
+        # Unregister WebSocket when connection closes
+        turn_manager.unregister_websocket(conversation_id)
 
 
 async def process_text_message(conversation_id: str, message: str, websocket: WebSocket):
@@ -368,7 +403,7 @@ async def process_text_message(conversation_id: str, message: str, websocket: We
         result = await turn_manager.process_turn_and_get_response(user_turn)
         
         if result:
-            # Only send text response - audio streaming removed
+            # Send text response
             if isinstance(result, tuple):
                 # Extract text response from tuple
                 ai_response, _ = result
@@ -386,6 +421,23 @@ async def process_text_message(conversation_id: str, message: str, websocket: We
     except Exception as e:
         logger.error(f"Failed to process text message: {e}")
         await websocket.send_text("Sorry, I encountered an error processing your message.")
+
+
+# Audio processing disabled - using frontend STT instead
+# async def process_audio_data(conversation_id: str, audio_data: bytes, websocket: WebSocket):
+#     """Process audio data through the AI pipeline."""
+#     try:
+#         logger.info(f"Processing audio data for conversation {conversation_id}: {len(audio_data)} bytes")
+#         
+#         # Process audio through LiveKit bridge for STT
+#         await livekit_bridge.process_audio_data(conversation_id, audio_data)
+#         
+#         # Send acknowledgment
+#         await websocket.send_text("Audio received and processing...")
+#         
+#     except Exception as e:
+#         logger.error(f"Failed to process audio data: {e}")
+#         await websocket.send_text("Sorry, I encountered an error processing your audio.")
 
 
 # ============================================================================

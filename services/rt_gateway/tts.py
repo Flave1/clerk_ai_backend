@@ -53,13 +53,18 @@ class TTSService:
         try:
             # Try ElevenLabs first, fallback to AWS Polly
             if self.elevenlabs_client:
-                response = await self._synthesize_elevenlabs(request)
+                try:
+                    return await self._synthesize_elevenlabs(request)
+                except Exception as e:
+                    logger.error(f"ElevenLabs failed, trying AWS Polly: {e}")
+                    if self.aws_polly:
+                        return await self._synthesize_polly(request)
+                    else:
+                        raise RuntimeError("ElevenLabs failed and no AWS Polly fallback")
             elif self.aws_polly:
-                response = await self._synthesize_polly(request)
+                return await self._synthesize_polly(request)
             else:
                 raise RuntimeError("No TTS service available")
-
-            return response
 
         except Exception as e:
             logger.error(f"TTS synthesis failed: {e}")
@@ -75,13 +80,26 @@ class TTSService:
                 else "21m00Tcm4TlvDq8ikWAM"
             )
 
-            # Generate audio
-            audio = elevenlabs.generate(
-                text=request.text, voice=voice_id, model="eleven_monolingual_v1"
+            # Generate audio using streaming approach
+            audio_generator = elevenlabs.generate(
+                text=request.text, 
+                voice=voice_id, 
+                model="eleven_monolingual_v1",
+                stream=True
             )
 
-            # Convert to bytes
-            audio_bytes = b"".join(audio)
+            # Collect audio chunks
+            audio_chunks = []
+            for chunk in audio_generator:
+                if isinstance(chunk, bytes):
+                    audio_chunks.append(chunk)
+                else:
+                    logger.warning(f"Unexpected chunk type: {type(chunk)}")
+            
+            # Combine all chunks
+            audio_bytes = b"".join(audio_chunks)
+            
+            logger.info(f"ElevenLabs generated {len(audio_bytes)} bytes of audio")
 
             # Estimate duration (rough calculation)
             duration = len(request.text) * 0.1  # ~100ms per character
