@@ -73,81 +73,12 @@ class DynamoDBDAO:
                 f"{settings.dynamodb_table_prefix}meetings"
             )
 
-            # Create tables if they don't exist (for development)
-            # await self._create_tables_if_not_exist()
-
             self.initialized = True
             logger.info("DynamoDB DAO initialized successfully")
 
         except Exception as e:
             logger.error(f"Failed to initialize DynamoDB DAO: {e}")
             raise
-
-    async def _create_tables_if_not_exist(self):
-        """Create tables if they don't exist (development only)."""
-        try:
-            # This is a simplified version - in production, use Terraform
-            tables_to_create = [
-                {
-                    "name": f"{settings.dynamodb_table_prefix}{settings.conversations_table}",
-                    "key_schema": [{"AttributeName": "id", "KeyType": "HASH"}],
-                    "attribute_definitions": [
-                        {"AttributeName": "id", "AttributeType": "S"},
-                        {"AttributeName": "user_id", "AttributeType": "S"},
-                        {"AttributeName": "started_at", "AttributeType": "S"},
-                    ],
-                    "global_secondary_indexes": [
-                        {
-                            "IndexName": "user-id-index",
-                            "KeySchema": [
-                                {"AttributeName": "user_id", "KeyType": "HASH"},
-                                {"AttributeName": "started_at", "KeyType": "RANGE"},
-                            ],
-                            "Projection": {"ProjectionType": "ALL"},
-                            "ProvisionedThroughput": {
-                                "ReadCapacityUnits": 5,
-                                "WriteCapacityUnits": 5,
-                            },
-                        }
-                    ],
-                },
-                {
-                    "name": f"{settings.dynamodb_table_prefix}meetings",
-                    "key_schema": [{"AttributeName": "id", "KeyType": "HASH"}],
-                    "attribute_definitions": [
-                        {"AttributeName": "id", "AttributeType": "S"},
-                        {"AttributeName": "organizer_email", "AttributeType": "S"},
-                        {"AttributeName": "start_time", "AttributeType": "S"},
-                    ],
-                    "global_secondary_indexes": [
-                        {
-                            "IndexName": "organizer-start-index",
-                            "KeySchema": [
-                                {"AttributeName": "organizer_email", "KeyType": "HASH"},
-                                {"AttributeName": "start_time", "KeyType": "RANGE"},
-                            ],
-                            "Projection": {"ProjectionType": "ALL"},
-                            "ProvisionedThroughput": {
-                                "ReadCapacityUnits": 5,
-                                "WriteCapacityUnits": 5,
-                            },
-                        }
-                    ],
-                }
-            ]
-
-            for table_config in tables_to_create:
-                try:
-                    self.dynamodb.create_table(**table_config)
-                    logger.info(f"Created table: {table_config['name']}")
-                except ClientError as e:
-                    if e.response["Error"]["Code"] == "ResourceInUseException":
-                        logger.info(f"Table already exists: {table_config['name']}")
-                    else:
-                        raise
-
-        except Exception as e:
-            logger.warning(f"Failed to create tables: {e}")
 
     # Conversation operations
     async def create_conversation(self, conversation: Conversation) -> Conversation:
@@ -629,6 +560,26 @@ class DynamoDBDAO:
             logger.error(f"Failed to get meetings: {e}")
             raise
 
+    async def get_meeting_by_url(self, meeting_url: str) -> Optional[Meeting]:
+        """Get a meeting by URL."""
+        try:
+            # Scan through meetings to find one matching the URL
+            # Note: This is inefficient for large datasets. Consider adding a GSI on meeting_url
+            response = self.meetings_table.scan(
+                FilterExpression=Attr('meeting_url').eq(meeting_url),
+                Limit=1
+            )
+            
+            if "Items" not in response or len(response["Items"]) == 0:
+                return None
+            
+            item = response["Items"][0]
+            return self._item_to_meeting(item)
+
+        except Exception as e:
+            logger.error(f"Failed to get meeting by URL: {e}")
+            raise
+
     async def delete_meeting(self, meeting_id: str) -> bool:
         """Delete a meeting from DynamoDB."""
         try:
@@ -804,6 +755,104 @@ class DynamoDBDAO:
             video_enabled=item.get("video_enabled", False),
             recording_enabled=item.get("recording_enabled", False),
         )
+
+    async def add_meeting_participant(self, meeting_id: str, participant: Dict[str, Any]) -> bool:
+        """Add a participant to a meeting."""
+        try:
+            if not self.meetings_table:
+                logger.warning("Meetings table not initialized")
+                return False
+            
+            # Get the meeting first
+            response = self.meetings_table.get_item(
+                Key={'id': meeting_id}
+            )
+            
+            if 'Item' not in response:
+                logger.error(f"Meeting {meeting_id} not found")
+                return False
+            
+            meeting = response['Item']
+            
+            # Initialize participants list if it doesn't exist
+            if 'participants' not in meeting:
+                meeting['participants'] = []
+            
+            # Add the new participant
+            meeting['participants'].append(participant)
+            meeting['participant_count'] = len(meeting['participants'])
+            meeting['updated_at'] = datetime.utcnow().isoformat()
+            
+            # Update the meeting
+            self.meetings_table.put_item(Item=meeting)
+            
+            logger.info(f"Added participant {participant['id']} to meeting {meeting_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding meeting participant: {e}")
+            return False
+
+    async def remove_meeting_participant(self, meeting_id: str, participant_id: str) -> bool:
+        """Remove a participant from a meeting."""
+        try:
+            if not self.meetings_table:
+                logger.warning("Meetings table not initialized")
+                return False
+            
+            # Get the meeting first
+            response = self.meetings_table.get_item(
+                Key={'id': meeting_id}
+            )
+            
+            if 'Item' not in response:
+                logger.error(f"Meeting {meeting_id} not found")
+                return False
+            
+            meeting = response['Item']
+            
+            # Remove the participant
+            if 'participants' in meeting:
+                meeting['participants'] = [
+                    p for p in meeting['participants'] 
+                    if p['id'] != participant_id
+                ]
+                meeting['participant_count'] = len(meeting['participants'])
+                meeting['updated_at'] = datetime.utcnow().isoformat()
+                
+                # Update the meeting
+                self.meetings_table.put_item(Item=meeting)
+                
+                logger.info(f"Removed participant {participant_id} from meeting {meeting_id}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error removing meeting participant: {e}")
+            return False
+
+    async def get_meeting_participants(self, meeting_id: str) -> List[Dict[str, Any]]:
+        """Get all participants for a meeting."""
+        try:
+            if not self.meetings_table:
+                logger.warning("Meetings table not initialized")
+                return []
+            
+            response = self.meetings_table.get_item(
+                Key={'id': meeting_id}
+            )
+            
+            if 'Item' not in response:
+                logger.error(f"Meeting {meeting_id} not found")
+                return []
+            
+            meeting = response['Item']
+            return meeting.get('participants', [])
+            
+        except Exception as e:
+            logger.error(f"Error getting meeting participants: {e}")
+            return []
 
 
 # Dependency injection

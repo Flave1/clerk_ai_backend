@@ -43,9 +43,9 @@ class GoogleCalendarTool:
             
             # Handle relative paths by resolving them relative to the project root
             client_config_path = settings.google_oauth_client_config
+
             if not client_config_path.startswith('/'):
                 client_config_path = BASE_DIR / client_config_path
-            
             # Set up token file path
             self.token_file = BASE_DIR / "google_calendar_token.json"
             

@@ -8,6 +8,9 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import AsyncGenerator, Optional, Dict, Any
+import secrets
+import string
+import random
 import json
 
 import aiohttp
@@ -130,7 +133,8 @@ class MicrosoftTeamsClient:
         
         logger.warning(f"Could not extract meeting ID from URL: {meeting_url}")
         return None
-    
+
+
     async def join_meeting(self, meeting: Meeting) -> MeetingJoinResponse:
         """
         Join a Microsoft Teams meeting using Bot Framework.
@@ -788,7 +792,7 @@ class MicrosoftTeamsClient:
                 attendees=attendees,
                 description=description
             )
-            
+            logger.info(f"Teams meeting data returned from Graph API: {json.dumps(teams_meeting_data, indent=2)}")
             if not teams_meeting_data:
                 return {
                     "success": False,
@@ -813,48 +817,40 @@ class MicrosoftTeamsClient:
                         response_status="accepted"
                     ))
             
-            # Create meeting object
-            meeting = Meeting(
-                id=meeting_id,
-                platform=MeetingPlatform.MICROSOFT_TEAMS,
-                meeting_url=join_url,
-                meeting_id_external=external_meeting_id,
-                title=title,
-                description=description or "",
-                start_time=start_dt,
-                end_time=end_dt,
-                organizer_email=settings.ai_email,
-                participants=participants,
-                status=MeetingStatus.SCHEDULED,
-                ai_email=settings.ai_email,
-                audio_enabled=True,
-                video_enabled=True,
-                recording_enabled=False
-            )
-            
-            # Save meeting to database
-            save_success = await self._save_meeting_to_db(meeting)
-            
-            if save_success:
-                return {
-                    "success": True,
-                    "meeting": {
-                        "id": meeting_id,
-                        "external_id": external_meeting_id,
-                        "join_url": join_url,
-                        "meeting_display_id": external_meeting_display_id,
-                        "title": title,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "duration_minutes": duration_minutes,
-                        "attendees": attendees or []
-                    }
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Failed to save meeting to database"
-                }
+            # Return meeting data without persisting to DB
+            # DB persistence should be handled by the caller after verifying success
+            return {
+                "success": True,
+                "meeting": {
+                    "id": meeting_id,
+                    "external_id": external_meeting_id,
+                    "join_url": join_url,
+                    "meeting_display_id": external_meeting_display_id,
+                    "title": title,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration_minutes": duration_minutes,
+                    "attendees": attendees or []
+                },
+                # Include raw meeting object for DB persistence in caller
+                "_meeting_obj": Meeting(
+                    id=meeting_id,
+                    platform=MeetingPlatform.MICROSOFT_TEAMS,
+                    meeting_url=join_url,
+                    meeting_id_external=external_meeting_id,
+                    title=title,
+                    description=description or "",
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    organizer_email=settings.ai_email,
+                    participants=participants,
+                    status=MeetingStatus.SCHEDULED,
+                    ai_email=settings.ai_email,
+                    audio_enabled=True,
+                    video_enabled=True,
+                    recording_enabled=False
+                )
+            }
                 
         except Exception as e:
             logger.error(f"Failed to create Microsoft Teams meeting: {e}")
@@ -897,57 +893,58 @@ class MicrosoftTeamsClient:
             if not self.access_token:
                 error_msg = "No Microsoft access token available. Please complete authentication."
                 logger.error(error_msg)
-                raise ValueError(error_msg)
+                return None
             
             # Get user ID for the organizer
             # When using application permissions, we need to use /users/{userId} instead of /me
             organizer_email = settings.ai_email
             user_id = await self._get_user_id_from_email(organizer_email)
             
-            if not user_id:
-                logger.warning(f"Could not get user ID for {organizer_email}, using email as fallback")
-                user_id = organizer_email
-            
-            # Microsoft Graph API endpoint for creating online meetings
-            # Use /users/{userId} for application permissions instead of /me
-            api_url = f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings"
+            # Determine which endpoint to use based on whether we have a valid user ID
+            # If we have a user ID, use /users/{userId}/onlineMeetings
+            # Otherwise, try /me/onlineMeetings (requires delegated permissions with user context)
+            if user_id:
+                api_url = f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings"
+                logger.info(f"Using user-specific endpoint for {organizer_email} (user ID: {user_id})")
+            else:
+                logger.warning(f"Could not get user ID for {organizer_email}, falling back to /me/onlineMeetings")
+                api_url = "https://graph.microsoft.com/v1.0/me/onlineMeetings"
             
             # Format times for Graph API (ISO 8601)
             start_time_str = start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             end_time_str = end_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             
             # Prepare meeting data according to Graph API specs
+            # Simplified payload - Graph API will use authenticated user as organizer
             meeting_data = {
-                "subject": subject,
-                "startDateTime": start_time_str,
-                "endDateTime": end_time_str,
-                "participants": {
-                    "organizer": {
-                        "identity": {
-                            "user": {
-                                "id": None,  # Will use authenticated user
-                                "displayName": None  # Will use authenticated user
-                            }
-                        }
-                    },
-                    "attendees": []
-                }
+                "subject": subject
             }
             
-            # Add attendees if provided
-            if attendees:
-                for email in attendees:
-                    meeting_data["participants"]["attendees"].append({
-                        "identity": {
-                            "user": {
-                                "id": None,
-                                "displayName": email.split('@')[0].replace('.', ' ').title()
-                            }
-                        },
-                        "upn": email  # User Principal Name (email)
-                    })
+            # Add optional fields
+            if start_time_str:
+                meeting_data["startDateTime"] = start_time_str
+            if end_time_str:
+                meeting_data["endDateTime"] = end_time_str
             
-            # Add description if provided
+            # Add attendees if provided - only if we're using user-specific endpoint
+            if attendees and user_id:
+                # For /users/{userId}/onlineMeetings, we can include attendees
+                meeting_data["participants"] = {
+                    "attendees": [
+                        {
+                            "upn": email,  # User Principal Name (email)
+                            "identity": {
+                                "user": {
+                                    "id": None,
+                                    "displayName": email.split('@')[0].replace('.', ' ').title()
+                                }
+                            }
+                        }
+                        for email in attendees
+                    ]
+                }
+            
+            # Add description if provided - combine with subject
             if description:
                 meeting_data["subject"] = f"{subject} - {description}"
             
@@ -962,14 +959,28 @@ class MicrosoftTeamsClient:
                     teams_response = await response.json()
                     logger.info(f"Successfully created Microsoft Teams meeting via API: {teams_response.get('id')}")
                     return teams_response
+                elif response.status == 404:
+                    # 404 could mean wrong endpoint, missing permissions, or user not found
+                    error_text = await response.text()
+                    logger.error(f"Microsoft Graph API 404 error - endpoint may not exist or permissions insufficient: {error_text}")
+                    logger.error(f"Attempted URL: {api_url}")
+                    logger.error(f"Organizer email: {organizer_email}, User ID resolved: {user_id}")
+                    # Return None to allow fallback to other methods
+                    return None
                 else:
                     error_text = await response.text()
                     logger.error(f"Microsoft Graph API error ({response.status}): {error_text}")
-                    raise Exception(f"Microsoft Graph API returned error {response.status}: {error_text}")
+                    logger.error(f"Attempted URL: {api_url}")
+                    logger.error(f"Organizer email: {organizer_email}, User ID resolved: {user_id}")
+                    # Return None for all errors to allow graceful handling
+                    return None
                     
         except Exception as e:
             logger.error(f"Failed to create Microsoft Teams meeting via API: {e}")
-            raise
+            import traceback
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            # Return None to allow caller to handle gracefully
+            return None
     
     async def _get_user_id_from_email(self, email: str) -> Optional[str]:
         """

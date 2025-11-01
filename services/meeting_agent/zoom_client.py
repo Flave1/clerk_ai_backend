@@ -9,6 +9,8 @@ import logging
 from datetime import datetime
 from typing import AsyncGenerator, Optional, Dict, Any
 import json
+import re
+import urllib.parse
 
 import aiohttp
 # from pyzoomus import ZoomClient  # Package not available, using mock implementation
@@ -138,8 +140,6 @@ class ZoomClientWrapper:
     
     def extract_meeting_id(self, meeting_url: str) -> Optional[str]:
         """Extract meeting ID from Zoom URL."""
-        import re
-        
         patterns = [
             r'zoom\.us/j/(\d+)',
             r'zoom\.us/my/([a-zA-Z0-9]+)',
@@ -153,6 +153,47 @@ class ZoomClientWrapper:
         
         logger.warning(f"Could not extract meeting ID from URL: {meeting_url}")
         return None
+
+    def _normalize_join_url_for_browser(self, join_url: str) -> str:
+        """
+        Convert Zoom's default join URL (which launches the desktop app) into the
+        browser/PWA variant so the Playwright bot can join without native prompts.
+        """
+        try:
+            if not join_url:
+                return join_url
+            
+            parsed = urllib.parse.urlparse(join_url)
+            path = parsed.path or ''
+            
+            # Already targeting the browser client
+            if '/wc/' in path:
+                return join_url
+            
+            meeting_id_match = re.search(r'/j/([^/?]+)', path)
+            if not meeting_id_match:
+                return join_url
+            
+            meeting_id = meeting_id_match.group(1)
+            query_params = urllib.parse.parse_qs(parsed.query)
+            pwd = query_params.get('pwd', [None])[0]
+            
+            normalized_query = {'fromPWA': '1'}
+            if pwd:
+                normalized_query['pwd'] = pwd
+            
+            normalized_url = urllib.parse.urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                f'/wc/{meeting_id}/join',
+                '',
+                urllib.parse.urlencode(normalized_query),
+                ''
+            ))
+            return normalized_url
+        except Exception as e:
+            logger.warning(f"Failed to normalize Zoom join URL '{join_url}': {e}")
+            return join_url
     
     async def join_meeting(self, meeting: Meeting) -> MeetingJoinResponse:
         """
@@ -231,9 +272,6 @@ class ZoomClientWrapper:
     
     def _extract_password_from_url(self, meeting_url: str) -> Optional[str]:
         """Extract password from Zoom meeting URL."""
-        import re
-        import urllib.parse
-        
         try:
             # Password is in the pwd parameter
             # Example: https://zoom.us/j/123456?pwd=abc123
@@ -380,6 +418,8 @@ class ZoomClientWrapper:
             if not join_url:
                 logger.error("No join URL available")
                 return False
+            
+            join_url = self._normalize_join_url_for_browser(join_url)
             
             # In a real implementation, we would use the Zoom SDK to join
             # For now, we'll simulate successful joining
@@ -859,6 +899,7 @@ class ZoomClientWrapper:
             meeting_id = str(uuid4())  # Our internal UUID
             external_meeting_id = str(zoom_meeting_data.get('id', ''))
             join_url = zoom_meeting_data.get('join_url', '')
+            browser_join_url = self._normalize_join_url_for_browser(join_url)
             start_url = zoom_meeting_data.get('start_url', '')
             
             # Create meeting participants
@@ -872,48 +913,40 @@ class ZoomClientWrapper:
                         response_status="accepted"
                     ))
             
-            # Create meeting object
-            meeting = Meeting(
-                id=meeting_id,
-                platform=MeetingPlatform.ZOOM,
-                meeting_url=join_url,
-                meeting_id_external=external_meeting_id,
-                title=title,
-                description=description or "",
-                start_time=start_dt,
-                end_time=end_dt,
-                organizer_email="favouremmanuel433@gmail.com",
-                participants=participants,
-                status=MeetingStatus.SCHEDULED,
-                ai_email="favouremmanuel433@gmail.com",
-                audio_enabled=True,
-                video_enabled=True,
-                recording_enabled=False
-            )
-            
-            # Save meeting to database
-            save_success = await self._save_meeting_to_db(meeting)
-            
-            if save_success:
-                return {
-                    "success": True,
-                    "meeting": {
-                        "id": meeting_id,
-                        "external_id": external_meeting_id,
-                        "join_url": join_url,
-                        "start_url": start_url,
-                        "title": title,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "duration_minutes": duration_minutes,
-                        "attendees": attendees or []
-                    }
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Failed to save meeting to database"
-                }
+            # Return meeting data without persisting to DB
+            # DB persistence should be handled by the caller after verifying success
+            return {
+                "success": True,
+                "meeting": {
+                    "id": meeting_id,
+                    "external_id": external_meeting_id,
+                    "join_url": browser_join_url,
+                    "start_url": start_url,
+                    "title": title,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration_minutes": duration_minutes,
+                    "attendees": attendees or []
+                },
+                # Include raw meeting object for DB persistence in caller
+                "_meeting_obj": Meeting(
+                    id=meeting_id,
+                    platform=MeetingPlatform.ZOOM,
+                    meeting_url=browser_join_url,
+                    meeting_id_external=external_meeting_id,
+                    title=title,
+                    description=description or "",
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    organizer_email="favouremmanuel433@gmail.com",
+                    participants=participants,
+                    status=MeetingStatus.SCHEDULED,
+                    ai_email="favouremmanuel433@gmail.com",
+                    audio_enabled=True,
+                    video_enabled=True,
+                    recording_enabled=False
+                )
+            }
                 
         except Exception as e:
             logger.error(f"Failed to create Zoom meeting: {e}")

@@ -9,9 +9,19 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
+import sys
 
-from langchain.llms import OpenAI
-from langchain.chat_models import ChatOpenAI
+# Python 3.12 compatibility fix for pydantic v1 ForwardRef._evaluate()
+if sys.version_info >= (3, 12):
+    import pydantic.v1.typing as pydantic_v1_typing
+    original_evaluate = pydantic_v1_typing.evaluate_forwardref
+    def patched_evaluate_forwardref(type_, globalns, localns):
+        # Python 3.12 requires recursive_guard as a keyword argument
+        return type_._evaluate(globalns, localns, set(), recursive_guard=set())
+    pydantic_v1_typing.evaluate_forwardref = patched_evaluate_forwardref
+
+from langchain_community.llms import OpenAI
+from langchain_community.chat_models import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from langchain.prompts import ChatPromptTemplate, PromptTemplate
 from langchain.chains import LLMChain

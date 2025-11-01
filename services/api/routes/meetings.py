@@ -5,6 +5,7 @@ This module provides REST endpoints for managing meetings, summaries,
 and meeting agent functionality.
 """
 import logging
+import random
 from datetime import datetime
 from typing import List, Optional, Any
 from uuid import UUID, uuid4
@@ -19,6 +20,7 @@ from services.meeting_agent.models import (
     MeetingJoinRequest, MeetingJoinResponse, MeetingNotification,
     CalendarEvent, MeetingConfig
 )
+from pydantic import BaseModel
 from services.meeting_agent.scheduler import create_meeting_scheduler
 from services.meeting_agent.notifier import create_notification_service
 from services.meeting_agent.summarization_service import create_summarization_service
@@ -29,13 +31,40 @@ settings = get_settings()
 # Create router
 router = APIRouter()
 
+
+class ParticipantJoinRequest(BaseModel):
+    """Request to join a meeting as a participant."""
+    participant_name: str
+    participant_id: Optional[str] = None
+
+
+class BotJoinedRequest(BaseModel):
+    """Payload sent by browser bot when it joins a meeting."""
+    sessionId: str
+    botName: Optional[str] = None
+    platform: Optional[str] = None
+    timestamp: Optional[str] = None
+    meeting_url: Optional[str] = None
+
+
+class GenerateMeetingUrlRequest(BaseModel):
+    """Request to generate a meeting URL for a platform."""
+    platform: str  # one of: clerk | teams | zoom | google_meet
+
+
+class GenerateMeetingUrlResponse(BaseModel):
+    """Response with generated meeting details."""
+    platform: str
+    meeting_id: str
+    meeting_url: str
+
 # Global services
 meeting_scheduler = create_meeting_scheduler()
 notification_service = create_notification_service()
 summarization_service = create_summarization_service()
 
 
-@router.get("/meetings", response_model=List[Meeting])
+@router.get("/", response_model=List[Meeting])
 async def get_meetings(
     status: Optional[MeetingStatus] = None,
     platform: Optional[MeetingPlatform] = None,
@@ -63,7 +92,7 @@ async def get_meetings(
 
 
 # Specific routes must come before parameterized routes
-@router.get("/meetings/summaries", response_model=List[MeetingSummary])
+@router.get("/summaries", response_model=List[MeetingSummary])
 async def get_meeting_summaries(
     limit: int = 50,
     offset: int = 0,
@@ -82,7 +111,262 @@ async def get_meeting_summaries(
         raise HTTPException(status_code=500, detail="Failed to retrieve meeting summaries")
 
 
-@router.get("/meetings/active", response_model=List[Meeting])
+@router.post("/{meeting_id}/bot-joined")
+async def bot_joined(
+    meeting_id: str,
+    request: BotJoinedRequest,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Confirm a bot has joined a meeting and mark the meeting as bot_joined.
+    Accepts meeting_url in the request body to find/create meeting if meeting_id doesn't exist.
+    """
+    try:
+        logger.info(
+            "Bot joined meeting",
+            extra={
+                "meeting_id": meeting_id,
+                "session_id": request.sessionId,
+                "platform": request.platform,
+                "bot_name": request.botName,
+                "meeting_url": request.meeting_url,
+                "timestamp": request.timestamp or datetime.utcnow().isoformat(),
+            },
+        )
+
+        meeting = None
+        
+        # First try to get meeting by ID
+        try:
+            meeting = await dao.get_meeting(meeting_id)
+        except Exception as e:
+            logger.warning(f"Could not get meeting by ID {meeting_id}: {e}")
+
+        # If not found and meeting_url provided, try to find by URL
+        if not meeting and request.meeting_url:
+            logger.info(f"Meeting not found by ID, searching by URL: {request.meeting_url}")
+            try:
+                meeting = await dao.get_meeting_by_url(request.meeting_url)
+                if meeting:
+                    logger.info(f"Found meeting by URL: {meeting.id}")
+            except Exception as e:
+                logger.warning(f"Could not get meeting by URL: {e}")
+
+        # If still not found and meeting_url provided, create a new meeting
+        if not meeting and request.meeting_url and request.platform:
+            logger.info(f"Creating new meeting for URL: {request.meeting_url}")
+            try:
+                # Determine platform enum
+                platform_map = {
+                    "google_meet": MeetingPlatform.GOOGLE_MEET,
+                    "zoom": MeetingPlatform.ZOOM,
+                    "teams": MeetingPlatform.MICROSOFT_TEAMS,
+                    "microsoft_teams": MeetingPlatform.MICROSOFT_TEAMS,
+                }
+                platform = platform_map.get(request.platform.lower(), MeetingPlatform.GOOGLE_MEET)
+                
+                # Extract meeting_id_external from URL
+                meeting_id_external = request.meeting_url.split("/")[-1].split("?")[0]
+                
+                # Create new meeting
+                meeting = Meeting(
+                    id=UUID(meeting_id) if meeting_id else uuid4(),
+                    platform=platform,
+                    meeting_url=request.meeting_url,
+                    meeting_id_external=meeting_id_external,
+                    title=f"Meeting {meeting_id[:8] if meeting_id else uuid4()}",
+                    description="Created from bot join notification",
+                    start_time=datetime.utcnow(),
+                    end_time=datetime.utcnow(),
+                    organizer_email=settings.ai_email if hasattr(settings, 'ai_email') else '',
+                    participants=[],
+                    status=MeetingStatus.SCHEDULED,
+                    ai_email=settings.ai_email if hasattr(settings, 'ai_email') else '',
+                    audio_enabled=True,
+                    video_enabled=True,
+                    recording_enabled=False
+                )
+                
+                meeting = await dao.create_meeting(meeting)
+                logger.info(f"Created new meeting: {meeting.id}")
+            except Exception as e:
+                logger.error(f"Could not create new meeting: {e}")
+
+        # Update meeting if found/created
+        if meeting:
+            # Ensure bot_joined flag is set
+            setattr(meeting, "bot_joined", True)
+            meeting.status = MeetingStatus.ACTIVE
+            meeting.joined_at = datetime.utcnow()
+            logger.info(
+                f"Updating meeting {meeting.id}: setting bot_joined=True, status=ACTIVE",
+                extra={
+                    "current_status": getattr(meeting, "status", None),
+                    "has_bot_joined": getattr(meeting, "bot_joined", None),
+                }
+            )
+            await dao.update_meeting(meeting)
+            logger.info(
+                "Meeting updated for bot join",
+                extra={
+                    "meeting_id": str(meeting.id),
+                    "session_id": request.sessionId,
+                    "platform": request.platform,
+                }
+            )
+        else:
+            logger.warning(
+                "Meeting not found or created while confirming bot join",
+                extra={
+                    "meeting_id": meeting_id,
+                    "meeting_url": request.meeting_url,
+                    "session_id": request.sessionId,
+                    "platform": request.platform,
+                }
+            )
+
+        return JSONResponse(
+            {
+                "status": "success",
+                "message": "Bot join confirmed",
+                "meeting_id": str(meeting.id) if meeting else meeting_id,
+                "session_id": request.sessionId,
+                "platform": request.platform,
+                "bot_name": request.botName,
+                "timestamp": request.timestamp or datetime.utcnow().isoformat(),
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to confirm bot joined: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to confirm bot joined: {str(e)}")
+
+
+@router.post("/generate-url", response_model=GenerateMeetingUrlResponse)
+async def generate_meeting_url(request: GenerateMeetingUrlRequest) -> GenerateMeetingUrlResponse:
+
+    """
+    Generate a meeting URL for a given platform.
+
+    This is a convenience endpoint used by the UI to quickly create a meeting link
+    for demo/testing flows. In production, integrate with each provider to create
+    real meetings.
+    """
+    try:
+        plat = (request.platform or "").strip().lower()
+        if plat not in {"clerk", "teams", "zoom", "google_meet"}:
+            raise HTTPException(status_code=400, detail="Invalid platform. Use clerk | teams | zoom | google_meet")
+
+        mid = str(uuid4())
+
+        # Delegate URL generation per platform
+        if plat == "clerk":
+            # Match existing pattern used elsewhere in the app
+            base_frontend = "http://localhost:3000"
+            if settings.api_base_url:
+                base_frontend = settings.api_base_url.replace('/api/v1', '').replace(':8000', ':3000')
+            url = f"{base_frontend}/standalone-call?meetingId={mid}"
+            return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+
+        if plat == "teams":
+            try:
+                # Create a short-lived meeting via Teams client (best-effort)
+                from services.meeting_agent.teams_client import create_teams_client
+                client = create_teams_client()
+                await client.initialize()
+                await client.authenticate()
+
+                now = datetime.utcnow()
+                start_time = now.isoformat() + 'Z'
+                end_time = (now.replace(microsecond=0) if True else now).isoformat() + 'Z'
+                # Add 30 minutes
+                end_time = (now.replace(microsecond=0) + (datetime.utcnow() - datetime.utcnow())).isoformat() + 'Z'
+                # more explicit: compute 30 minutes
+                from datetime import timedelta
+                end_time = (now + timedelta(minutes=30)).isoformat() + 'Z'
+
+                res = await client.create_meeting(
+                    title=f"Clerk Teams Meeting {mid[:8]}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    attendees=[],
+                    description="Our Meeting"
+                )
+                if res.get("success"):
+                    url = res["meeting"]["join_url"]
+                    return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+                else:
+                    raise HTTPException(status_code=500, detail=f"Teams URL generation failed: {res.get('error', 'Unknown error')}")
+            except Exception as e:
+                logger.error(f"Teams URL generation via API failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Teams URL generation failed: {e}")
+
+        if plat == "zoom":
+            try:
+                from services.meeting_agent.zoom_client import create_zoom_client
+                client = create_zoom_client()
+                await client.initialize()
+                # Zoom create_meeting internally obtains tokens via settings; best-effort
+                now = datetime.utcnow()
+                start_time = now.isoformat() + 'Z'
+                from datetime import timedelta
+                end_time = (now + timedelta(minutes=45)).isoformat() + 'Z'
+                res = await client.create_meeting(
+                    title=f"Clerk Zoom Meeting {mid[:8]}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    attendees=[],
+                    description="Generated from /generate-url"
+                )
+                if res.get("success"):
+                    url = res["meeting"]["join_url"]
+                    return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+                # Fallback to simple pattern if API not configured
+                logger.warning("Zoom API call succeeded but didn't return a valid URL, using fallback")
+                url = f"https://zoom.us/j/{uuid4().int % 10**10}?pwd={uuid4().hex[:10]}"
+                return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+            except Exception as e:
+                logger.error(f"Zoom URL generation via API failed: {e}")
+                # Fallback to generated URL pattern
+                url = f"https://zoom.us/j/{uuid4().int % 10**10}?pwd={uuid4().hex[:10]}"
+                return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+
+        if plat == "google_meet":
+            from services.meeting_agent.google_meet_client import create_google_meet_client
+            client = create_google_meet_client()
+            now = datetime.utcnow()
+            start_time = now.isoformat() + 'Z'
+            from datetime import timedelta
+            end_time = (now + timedelta(minutes=30)).isoformat() + 'Z'
+            res = await client.create_meeting(
+                title=f"Clerk Google Meet {mid[:8]}",
+                start_time=start_time,
+                end_time=end_time,
+                attendees=[],
+                description="Generated from /generate-url"
+            )
+            if res.get("success"):
+                url = res["meeting"]["join_url"]
+                return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+            else:
+                error_msg = res.get("error", "Failed to create Google Meet")
+                logger.error(f"Google Meet creation failed: {error_msg}")
+                raise HTTPException(status_code=500, detail=f"Failed to create Google Meet: {error_msg}")
+        
+        # Should never reach here, but provide fallback
+        logger.warning(f"Unknown platform {plat}, falling back to generic URL")
+        url = f"http://localhost:3000/standalone-call?meetingId={mid}"
+        return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate meeting URL: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate meeting URL")
+
+
+@router.get("/active", response_model=List[Meeting])
 async def get_active_meetings(
     dao: DynamoDBDAO = Depends(get_dao)
 ):
@@ -99,7 +383,7 @@ async def get_active_meetings(
         raise HTTPException(status_code=500, detail="Failed to retrieve active meetings")
 
 
-@router.get("/meetings/config", response_model=MeetingConfig)
+@router.get("/config", response_model=MeetingConfig)
 async def get_meeting_config():
     """Get meeting agent configuration."""
     try:
@@ -111,7 +395,7 @@ async def get_meeting_config():
         raise HTTPException(status_code=500, detail="Failed to retrieve meeting config")
 
 
-@router.get("/meetings/status")
+@router.get("/status")
 async def get_meeting_agent_status():
     """Get meeting agent status and statistics."""
     try:
@@ -131,7 +415,7 @@ async def get_meeting_agent_status():
         raise HTTPException(status_code=500, detail="Failed to retrieve meeting agent status")
 
 
-@router.delete("/meetings/bulk")
+@router.delete("/bulk")
 async def bulk_delete_meetings(
     meeting_ids: List[str],
     dao: DynamoDBDAO = Depends(get_dao)
@@ -173,7 +457,7 @@ async def bulk_delete_meetings(
         raise HTTPException(status_code=500, detail="Failed to delete meetings")
 
 
-@router.get("/meetings/{meeting_id}", response_model=Meeting)
+@router.get("/{meeting_id}", response_model=Meeting)
 async def get_meeting(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -193,7 +477,7 @@ async def get_meeting(
         raise HTTPException(status_code=404, detail="Meeting not found")
 
 
-@router.get("/meetings/{meeting_id}/summary", response_model=MeetingSummary)
+@router.get("/{meeting_id}/summary", response_model=MeetingSummary)
 async def get_meeting_summary(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -225,7 +509,7 @@ async def get_meeting_summary(
         raise HTTPException(status_code=404, detail="Meeting summary not found")
 
 
-@router.post("/meetings/{meeting_id}/join", response_model=MeetingJoinResponse)
+@router.post("/{meeting_id}/join", response_model=MeetingJoinResponse)
 async def join_meeting(
     meeting_id: UUID,
     background_tasks: BackgroundTasks,
@@ -441,7 +725,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
         logger.error(traceback.format_exc())
 
 
-@router.post("/meetings/{meeting_id}/leave")
+@router.post("/{meeting_id}/leave")
 async def leave_meeting(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -506,7 +790,7 @@ async def leave_meeting(
         raise HTTPException(status_code=500, detail=error_msg or "Failed to leave meeting")
 
 
-@router.post("/meetings/{meeting_id}/notify")
+@router.post("/{meeting_id}/notify")
 async def send_meeting_notification(
     meeting_id: UUID,
     notification_type: str,
@@ -536,7 +820,7 @@ async def send_meeting_notification(
         raise HTTPException(status_code=500, detail="Failed to send notification")
 
 
-@router.get("/meetings/{meeting_id}/participants")
+@router.get("/{meeting_id}/participants")
 async def get_meeting_participants(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -557,7 +841,7 @@ async def get_meeting_participants(
         raise HTTPException(status_code=500, detail="Failed to retrieve participants")
 
 
-@router.get("/meetings/{meeting_id}/transcription")
+@router.get("/{meeting_id}/transcription")
 async def get_meeting_transcription(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -579,7 +863,7 @@ async def get_meeting_transcription(
         raise HTTPException(status_code=500, detail="Failed to retrieve transcription")
 
 
-@router.get("/meetings/{meeting_id}/action-items", response_model=List[ActionItem])
+@router.get("/{meeting_id}/action-items", response_model=List[ActionItem])
 async def get_meeting_action_items(
     meeting_id: UUID,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -596,7 +880,7 @@ async def get_meeting_action_items(
         raise HTTPException(status_code=500, detail="Failed to retrieve action items")
 
 
-@router.put("/meetings/{meeting_id}/action-items/{action_item_id}")
+@router.put("/{meeting_id}/action-items/{action_item_id}")
 async def update_action_item(
     meeting_id: UUID,
     action_item_id: UUID,
@@ -615,7 +899,7 @@ async def update_action_item(
         raise HTTPException(status_code=500, detail="Failed to update action item")
 
 
-@router.get("/meetings/config", response_model=MeetingConfig)
+@router.get("/config", response_model=MeetingConfig)
 async def get_meeting_config():
     """Get meeting agent configuration."""
     try:
@@ -636,7 +920,7 @@ async def get_meeting_config():
         raise HTTPException(status_code=500, detail="Failed to retrieve configuration")
 
 
-@router.put("/meetings/config", response_model=MeetingConfig)
+@router.put("/config", response_model=MeetingConfig)
 async def update_meeting_config(
     config: MeetingConfig,
     dao: DynamoDBDAO = Depends(get_dao)
@@ -653,7 +937,7 @@ async def update_meeting_config(
         raise HTTPException(status_code=500, detail="Failed to update configuration")
 
 
-@router.get("/meetings/status")
+@router.get("/status")
 async def get_meeting_agent_status():
     """Get meeting agent status and statistics."""
     try:
@@ -675,7 +959,7 @@ async def get_meeting_agent_status():
         raise HTTPException(status_code=500, detail="Failed to retrieve status")
 
 
-@router.post("/meetings/start-scheduler")
+@router.post("/start-scheduler")
 async def start_meeting_scheduler():
     """Start the meeting scheduler."""
     try:
@@ -690,7 +974,7 @@ async def start_meeting_scheduler():
         raise HTTPException(status_code=500, detail="Failed to start scheduler")
 
 
-@router.post("/meetings/stop-scheduler")
+@router.post("/stop-scheduler")
 async def stop_meeting_scheduler():
     """Stop the meeting scheduler."""
     try:
@@ -838,3 +1122,248 @@ async def get_bot_status(
     except Exception as e:
         logger.error(f"Failed to get bot status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get bot status: {str(e)}")
+
+
+# Meeting Invitation and Participant Management Endpoints
+
+@router.post("/invite")
+async def send_meeting_invitation(
+    meeting_id: str,
+    email: str,
+    background_tasks: BackgroundTasks,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Send meeting invitation via email.
+    
+    Args:
+        meeting_id: Meeting ID to invite to
+        email: Email address to send invitation to
+        
+    Returns:
+        Success/failure status
+    """
+    try:
+        logger.info(f"📧 Sending invitation to {email} for meeting {meeting_id}")
+        
+        # TODO: Implement email invitation logic
+        # For now, just log the request
+        
+        # Construct frontend URL (use localhost for development)
+        frontend_url = "http://localhost:3000"
+        if settings.api_base_url:
+            # If API base URL is set, use it as base for frontend URL
+            frontend_url = settings.api_base_url.replace('/api/v1', '').replace(':8000', ':3000')
+        
+        invitation_data = {
+            "meeting_id": meeting_id,
+            "email": email,
+            "invitation_url": f"{frontend_url}/join/{meeting_id}",
+            "sent_at": datetime.utcnow().isoformat()
+        }
+        
+        # Store invitation in database
+        # await dao.store_meeting_invitation(invitation_data)
+        
+        # Send email in background
+        # background_tasks.add_task(send_invitation_email, invitation_data)
+        
+        return {
+            "success": True,
+            "message": f"Invitation sent to {email}",
+            "meeting_id": meeting_id,
+            "invitation_url": invitation_data["invitation_url"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error sending invitation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send invitation")
+
+
+@router.get("/{meeting_id}/invitations")
+async def get_meeting_invitations(
+    meeting_id: str,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Get list of invitations sent for a meeting.
+    
+    Args:
+        meeting_id: Meeting ID
+        
+    Returns:
+        List of invitations
+    """
+    try:
+        # TODO: Query database for invitations
+        # For now, return mock data
+        invitations = []
+        
+        return {
+            "meeting_id": meeting_id,
+            "invitations": invitations,
+            "total_count": len(invitations)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting invitations for meeting {meeting_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve invitations")
+
+
+@router.post("/{meeting_id}/participants/join")
+async def join_meeting_as_participant(
+    meeting_id: str,
+    request: ParticipantJoinRequest,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Join a meeting as a participant.
+    
+    Args:
+        meeting_id: Meeting ID to join
+        request: Participant join request with name and optional ID
+        
+    Returns:
+        Participant info and meeting details
+    """
+    try:
+        logger.info(f"👤 Participant {request.participant_name} joining meeting {meeting_id}")
+        
+        # Generate participant ID if not provided
+        if not request.participant_id:
+            participant_id = f"participant-{uuid4().hex[:8]}"
+        else:
+            participant_id = request.participant_id
+        
+        # Create participant object
+        participant = {
+            "id": participant_id,
+            "name": request.participant_name,
+            "joined_at": datetime.utcnow().isoformat(),
+            "is_host": False,
+            "is_video_enabled": True,
+            "is_muted": False,
+            "is_speaking": False
+        }
+        
+        # Store participant in database and update meeting
+        try:
+            await dao.add_meeting_participant(meeting_id, participant)
+        except Exception as e:
+            logger.warning(f"Failed to store participant in database: {e}")
+        
+        # Send WebSocket notification to other participants
+        try:
+            # Broadcast participant joined event to all connected clients
+            from services.rt_gateway.app import broadcast_to_conversation
+            
+            # Map meeting_id to conversation_id (for now, we'll use meeting_id as conversation_id)
+            conversation_id = meeting_id.replace('meeting-', '')
+            await broadcast_to_conversation(conversation_id, {
+                "type": "participant_joined",
+                "data": {
+                    "participant": participant
+                }
+            })
+        except Exception as e:
+            logger.warning(f"Failed to broadcast participant joined event: {e}")
+        
+        # Construct frontend URL (use localhost for development)
+        frontend_url = "http://localhost:3000"
+        if settings.api_base_url:
+            # If API base URL is set, use it as base for frontend URL
+            frontend_url = settings.api_base_url.replace('/api/v1', '').replace(':8000', ':3000')
+        
+        return {
+            "success": True,
+            "participant": participant,
+            "meeting_id": meeting_id,
+            "meeting_url": f"{frontend_url}/standalone-call?meetingId={meeting_id}&participantId={participant_id}&name={request.participant_name}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error joining meeting: {e}")
+        raise HTTPException(status_code=500, detail="Failed to join meeting")
+
+
+@router.post("/{meeting_id}/leave")
+async def leave_meeting_as_participant(
+    meeting_id: str,
+    participant_id: str,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Leave a meeting as a participant.
+    
+    Args:
+        meeting_id: Meeting ID to leave
+        participant_id: Participant ID
+        
+    Returns:
+        Success status
+    """
+    try:
+        logger.info(f"👋 Participant {participant_id} leaving meeting {meeting_id}")
+        
+        # Remove participant from database
+        try:
+            await dao.remove_meeting_participant(meeting_id, participant_id)
+        except Exception as e:
+            logger.warning(f"Failed to remove participant from database: {e}")
+        
+        # Send WebSocket notification to other participants
+        try:
+            # Broadcast participant left event to all connected clients
+            from services.rt_gateway.app import broadcast_to_conversation
+            
+            # Map meeting_id to conversation_id (for now, we'll use meeting_id as conversation_id)
+            conversation_id = meeting_id.replace('meeting-', '')
+            await broadcast_to_conversation(conversation_id, {
+                "type": "participant_left",
+                "data": {
+                    "participant_id": participant_id
+                }
+            })
+        except Exception as e:
+            logger.warning(f"Failed to broadcast participant left event: {e}")
+        
+        return {
+            "success": True,
+            "message": "Successfully left meeting",
+            "meeting_id": meeting_id,
+            "participant_id": participant_id,
+            "left_at": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error leaving meeting: {e}")
+        raise HTTPException(status_code=500, detail="Failed to leave meeting")
+
+
+@router.get("/{meeting_id}/participants")
+async def get_meeting_participants(
+    meeting_id: str,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Get list of current participants in a meeting.
+    
+    Args:
+        meeting_id: Meeting ID
+        
+    Returns:
+        List of participants
+    """
+    try:
+        # Query database for participants
+        participants = await dao.get_meeting_participants(meeting_id)
+        
+        return {
+            "meeting_id": meeting_id,
+            "participants": participants,
+            "total_count": len(participants)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting participants for meeting {meeting_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve participants")

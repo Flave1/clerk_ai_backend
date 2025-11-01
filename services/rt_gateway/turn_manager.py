@@ -133,6 +133,27 @@ class TurnManager:
             logger.error(f"Failed to end conversation {conversation_id}: {e}")
             raise
 
+    async def add_participant_to_conversation(self, conversation_id: str, user_id: str):
+        """Add a participant to an existing conversation."""
+        try:
+            conversation = self.conversations.get(conversation_id)
+            if not conversation:
+                logger.warning(f"Conversation {conversation_id} not found")
+                return False
+
+            # Add user to conversation participants
+            if user_id not in conversation.participants:
+                conversation.participants.append(user_id)
+                logger.info(f"Added participant {user_id} to conversation {conversation_id}")
+                return True
+            else:
+                logger.info(f"Participant {user_id} already in conversation {conversation_id}")
+                return True
+            
+        except Exception as e:
+            logger.error(f"Error adding participant to conversation {conversation_id}: {e}")
+            raise
+
     async def create_turn(
         self,
         conversation_id: str,

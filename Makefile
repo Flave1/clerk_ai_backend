@@ -110,9 +110,9 @@ run-integration-tests:
 
 # Docker
 build:
-	docker build -f infra/docker/api.Dockerfile -t clerk-api .
-	docker build -f infra/docker/workers.Dockerfile -t clerk-workers .
-	docker build -f infra/docker/rt_gateway.Dockerfile -t clerk-rt-gateway .
+	docker build -f ../infra/docker/api.Dockerfile -t clerk-api .
+	docker build -f ../infra/docker/workers.Dockerfile -t clerk-workers .
+	docker build -f ../infra/docker/rt_gateway.Dockerfile -t clerk-rt-gateway .
 
 build-dev:
 	docker-compose -f docker-compose.dev.yml build

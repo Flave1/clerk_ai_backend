@@ -3,11 +3,10 @@ LLM service using LangGraph for stateful AI workflows with tool calling.
 """
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, TypedDict, Annotated
+from typing import Any, Dict, List, Optional, TypedDict, Annotated, AsyncIterator
 from uuid import UUID
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -284,7 +283,18 @@ class LLMService:
             except Exception as e:
                 logger.error(f"CRM tool error: {e}")
                 return f"❌ Error with CRM {action}: {str(e)}"
-
+        
+        def save_meeting_to_db(meeting_obj, meeting_id):
+                try:
+                    from services.api.dao import DynamoDBDAO
+                    dao = DynamoDBDAO()
+                    asyncio.run(dao.initialize())
+                    asyncio.run(dao.create_meeting(meeting_obj))
+                    logger.info(f"Saved Zoom meeting {meeting_id} to database")
+                except Exception as db_err:
+                    logger.error(f"Failed to save Zoom meeting to DB: {db_err}")
+                    # Continue anyway - meeting was created on Zoom
+        
         @tool
         def create_zoom_meeting(
             title: str,
@@ -340,6 +350,10 @@ class LLMService:
                 
                 if result["success"]:
                     meeting = result["meeting"]
+
+                    if "_meeting_obj" in result:
+                        save_meeting_to_db(result["_meeting_obj"], meeting['id'])
+                    
                     response = f"✅ Zoom meeting '{title}' created and saved to database!\n"
                     response += f"📅 Meeting ID: {meeting['id']}\n"
                     response += f"🔗 Join URL: {meeting['join_url']}\n"
@@ -417,6 +431,10 @@ class LLMService:
                 
                 if result["success"]:
                     meeting = result["meeting"]
+                    
+                    if "_meeting_obj" in result:
+                        save_meeting_to_db(result["_meeting_obj"], meeting['id'])
+                    
                     response = f"✅ Microsoft Teams meeting '{title}' created and saved to database!\n"
                     response += f"📅 Meeting ID: {meeting['id']}\n"
                     response += f"🔗 Join URL: {meeting['join_url']}\n"
@@ -616,6 +634,9 @@ class LLMService:
             logger.error(f"LangGraph generation failed: {e}")
             raise
 
+    
+  
+
     async def process_turn(
         self, turn: Turn, context: List[Dict[str, str]]
     ) -> Optional[LLMResponse]:
@@ -690,5 +711,142 @@ class LLMService:
         Always perform the appropriate tool action instead of explaining what you'd do.
         Remember: You're speaking through voice, so respond naturally and conversationally.
         """
+
+    async def generate_response_streaming(
+        self, 
+        text: Optional[str] = None,
+        audio_data: Optional[bytes] = None,
+        conversation_context: Optional[List[Dict[str, str]]] = None,
+        model: Optional[str] = None
+    ) -> AsyncIterator[str]:
+        """
+        Generate LLM response with streaming for real-time conversation.
+        Supports both text and audio input using GPT-4o.
+        
+        Args:
+            text: User's transcribed text (optional if audio_data provided)
+            audio_data: Raw PCM audio bytes (optional if text provided)
+            conversation_context: Previous messages for context (optional)
+            model: Override model (defaults to gpt-4o for audio, gpt-4o-mini for text)
+        
+        Yields:
+            Text chunks as they are generated
+        """
+        try:
+            import io
+            import wave
+            import base64
+            
+            if not settings.openai_api_key:
+                raise RuntimeError("OpenAI API key required for GPT-4o audio input")
+            
+            # Use GPT-4o for audio input, faster model for text
+            if audio_data:
+                # GPT-4o doesn't support direct audio in chat completions
+                # Transcribe audio with Whisper first, then send to GPT-4o
+                from openai import OpenAI
+                client = OpenAI(api_key=settings.openai_api_key)
+                
+                # Convert PCM audio to WAV format for Whisper
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(16000)  # 16kHz
+                    wav_file.writeframes(audio_data)
+                
+                wav_buffer.seek(0)
+                
+                # Step 1: Transcribe audio with Whisper (GPT-4o powered transcription)
+                logger.debug("🎤 Transcribing audio with Whisper...")
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=("audio.wav", wav_buffer.read(), "audio/wav"),
+                    language="en"
+                )
+                
+                transcribed_text = transcription.text.strip()
+                if not transcribed_text:
+                    logger.warning("⚠️ Whisper returned empty transcription")
+                    return  # Yield nothing for empty transcription
+                
+                logger.info(f"📝 Whisper transcription: '{transcribed_text}'")
+                
+                # Step 2: Send transcribed text to GPT-4o
+                messages = [{"role": "system", "content": self._get_system_prompt()}]
+                
+                # Add conversation context if provided
+                if conversation_context:
+                    for msg in conversation_context:
+                        if msg["role"] == "user":
+                            # Check if previous context was audio or text
+                            if isinstance(msg.get("content"), dict) and "audio" in msg.get("content", {}):
+                                continue  # Skip audio messages in context for now
+                            elif isinstance(msg.get("content"), str):
+                                messages.append({"role": "user", "content": msg["content"]})
+                        elif msg["role"] == "assistant":
+                            messages.append({"role": "assistant", "content": msg["content"]})
+                
+                # Add transcribed text as user message
+                messages.append({"role": "user", "content": transcribed_text})
+                
+                # Stream response from GPT-4o
+                logger.debug("🤖 Sending transcription to GPT-4o...")
+                stream = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    temperature=0.7,
+                    stream=True
+                )
+                
+                for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+                        
+            else:
+                # Text input - use fast model for low latency
+                if model is None:
+                    if settings.openai_api_key:
+                        fast_llm = ChatOpenAI(
+                            model="gpt-4o-mini",
+                            temperature=0.7,
+                            api_key=settings.openai_api_key,
+                            streaming=True
+                        )
+                    elif settings.anthropic_api_key:
+                        fast_llm = ChatAnthropic(
+                            model="claude-3-haiku-20240307",
+                            temperature=0.7,
+                            api_key=settings.anthropic_api_key,
+                            streaming=True
+                        )
+                    else:
+                        raise RuntimeError("No LLM API key configured for streaming")
+                else:
+                    fast_llm = self.llm
+                
+                # Build messages
+                messages = [SystemMessage(content=self._get_system_prompt())]
+                
+                # Add conversation context if provided
+                if conversation_context:
+                    for msg in conversation_context:
+                        if msg["role"] == "user":
+                            messages.append(HumanMessage(content=msg["content"]))
+                        elif msg["role"] == "assistant":
+                            messages.append(AIMessage(content=msg["content"]))
+                
+                # Add current user message
+                if text:
+                    messages.append(HumanMessage(content=text))
+                
+                # Stream response
+                async for chunk in fast_llm.astream(messages):
+                    if hasattr(chunk, 'content') and chunk.content:
+                        yield chunk.content
+                    
+        except Exception as e:
+            logger.error(f"Streaming LLM generation failed: {e}", exc_info=True)
+            yield f"I'm sorry, I encountered an error: {str(e)}"
 
 

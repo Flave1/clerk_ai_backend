@@ -32,7 +32,7 @@ The browser bot is implemented as a containerized Node.js application using Play
 ### 1. Build the Container
 
 ```bash
-cd services/meeting_agent/browser_bot
+cd browser_bot
 docker build -t clerk-browser-bot .
 ```
 
@@ -67,6 +67,7 @@ docker-compose -f browser_bot-compose.yml up -d
 | `MEETING_URL` | Meeting URL to join | Required |
 | `BOT_NAME` | Name of the bot participant | "Clerk AI Bot" |
 | `PLATFORM` | Meeting platform (google_meet, zoom, teams) | "google_meet" |
+| `MEETING_PASSCODE` | Passcode for password-protected meetings | "" |
 | `RT_GATEWAY_URL` | WebSocket URL for RT Gateway | "ws://localhost:8001" |
 | `API_BASE_URL` | REST API base URL | "http://localhost:8000" |
 | `MEETING_ID` | Unique meeting identifier | Auto-generated |
@@ -74,6 +75,12 @@ docker-compose -f browser_bot-compose.yml up -d
 | `JOIN_TIMEOUT_SEC` | Timeout for joining meeting | 60 |
 | `AUDIO_SAMPLE_RATE` | Audio sample rate | 16000 |
 | `AUDIO_CHANNELS` | Number of audio channels | 1 |
+| `ENABLE_AUDIO_CAPTURE` | Enable remote audio capture/streaming | true |
+| `ENABLE_TTS_PLAYBACK` | Enable TTS audio playback in meeting | true |
+| `HEADLESS` | Run Chromium in headless mode | true |
+| `BROWSER_LOCALE` | Locale passed to Chromium context | "en-US" |
+| `BROWSER_ARGS` | Extra comma-separated Chromium launch args | "" |
+| `BROWSER_USE_ASSIST` | Enable browser-use fallback helper for diagnostics | false |
 | `LOG_LEVEL` | Logging level | "info" |
 
 ### Platform-Specific Configuration
@@ -99,7 +106,7 @@ docker-compose -f browser_bot-compose.yml up -d
 
 1. Install dependencies:
 ```bash
-cd services/meeting_agent/browser_bot
+cd browser_bot
 npm install
 ```
 

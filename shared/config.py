@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
     anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
     elevenlabs_api_key: Optional[str] = Field(None, env="ELEVENLABS_API_KEY")
+    deepgram_api_key: Optional[str] = Field(None, env="DEEPGRAM_API_KEY")
 
     # STT/TTS Configuration
     default_voice_id: str = "default"
@@ -125,6 +126,10 @@ class Settings(BaseSettings):
     max_conversation_duration_minutes: int = 60
     audio_chunk_size: int = 4096
     audio_sample_rate: int = 16000
+
+    # External Turn Manager (meeting bot)
+    use_external_turn_manager: bool = Field(False, env="USE_EXTERNAL_TURN_MANAGER")
+    redis_url: str = Field("redis://localhost:6379", env="REDIS_URL")
 
     class Config:
         env_file = BASE_DIR / ".env"

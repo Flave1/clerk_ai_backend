@@ -211,9 +211,9 @@ mypy .
 
 ```bash
 # Build images
-docker build -f infra/docker/rt-gateway.Dockerfile -t clerk-rt-gateway .
-docker build -f infra/docker/api.Dockerfile -t clerk-api .
-docker build -f infra/docker/workers.Dockerfile -t clerk-workers .
+docker build -f ../infra/docker/rt-gateway.Dockerfile -t clerk-rt-gateway .
+docker build -f ../infra/docker/api.Dockerfile -t clerk-api .
+docker build -f ../infra/docker/workers.Dockerfile -t clerk-workers .
 
 # Run with docker-compose
 docker-compose up -d
@@ -223,7 +223,7 @@ docker-compose up -d
 
 ```bash
 # Deploy infrastructure
-cd infra/terraform
+cd ../infra/terraform
 terraform init
 terraform plan
 terraform apply

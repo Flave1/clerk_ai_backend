@@ -4,11 +4,15 @@ Text-to-Speech service using ElevenLabs and AWS Polly.
 import asyncio
 import io
 import logging
-from typing import Optional
+from typing import Optional, Iterator
+import struct
+import base64
 
 import boto3
 import elevenlabs
 from botocore.exceptions import ClientError
+import pydub
+from pydub.utils import make_chunks
 
 from shared.config import get_settings
 from shared.schemas import TTSRequest, TTSResponse
@@ -76,8 +80,8 @@ class TTSService:
             # Get voice ID (use default if not specified)
             voice_id = (
                 request.voice_id
-                if request.voice_id != "default"
-                else "21m00Tcm4TlvDq8ikWAM"
+                if request.voice_id and request.voice_id != "default"
+                else "21m00Tcm4TlvDq8ikWAM"  # Rachel voice - a commonly available ElevenLabs voice
             )
 
             # Generate audio using streaming approach
@@ -218,3 +222,182 @@ class TTSService:
         except Exception as e:
             logger.error(f"Failed to get available voices: {e}")
             return []
+
+    async def synthesize_to_pcm(self, text: str, voice_id: str = "default", model: str = "openai") -> Iterator[bytes]:
+        """
+        Synthesize text to PCM audio samples and yield in chunks in REAL-TIME.
+        Returns PCM float32 samples at 16kHz.
+        
+        Args:
+            text: Text to synthesize
+            voice_id: Voice ID to use
+            model: TTS provider to use - '11lab' (default, real-time streaming) or 'openai' (buffered)
+        
+        Default: ElevenLabs streaming for minimal latency.
+        Fallback: OpenAI TTS (buffered, not real-time) if ElevenLabs unavailable.
+        """
+        try:
+            # ElevenLabs REAL-TIME STREAMING (default - preferred for low latency)
+            if model == "11lab" and self.elevenlabs_client:
+                actual_voice_id = voice_id if voice_id != "default" else "21m00Tcm4TlvDq8ikWAM"
+                
+                # Stream MP3 chunks from ElevenLabs (low latency)
+                audio_generator = elevenlabs.generate(
+                    text=text, 
+                    voice=actual_voice_id, 
+                    model="eleven_monolingual_v1",
+                    stream=True  # Enable streaming
+                )
+                
+                # Real-time streaming: decode MP3 chunks as they arrive for minimal latency
+                mp3_buffer = b""
+                min_buffer_size = 4096  # Minimum bytes before attempting decode (very low latency)
+                max_attempts_per_chunk = 3  # Try decoding a few times if buffer grows
+                total_mp3_bytes = 0
+                total_pcm_samples = 0
+                
+                for mp3_chunk in audio_generator:
+                    if not isinstance(mp3_chunk, bytes):
+                        continue
+                        
+                    mp3_buffer += mp3_chunk
+                    total_mp3_bytes += len(mp3_chunk)
+                    
+                    # Attempt to decode as soon as we have minimum data (for ultra-low latency)
+                    # MP3 frames can be as small as ~144 bytes, but we need enough for a complete frame
+                    attempts = 0
+                    while len(mp3_buffer) >= min_buffer_size and attempts < max_attempts_per_chunk:
+                        try:
+                            # Decode MP3 chunk to PCM immediately
+                            audio_segment = pydub.AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
+                            audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+                            
+                            # Convert to float32 PCM samples
+                            samples = audio_segment.get_array_of_samples()
+                            float_samples = [float(s) / 32768.0 for s in samples]
+                            
+                            # Yield PCM chunks immediately (10k samples per chunk)
+                            # Skip tiny final chunks to prevent continuous clicking sounds
+                            chunk_size = 10000
+                            min_chunk_size = 1000  # Don't send chunks smaller than this
+                            
+                            for i in range(0, len(float_samples), chunk_size):
+                                chunk = float_samples[i:i + chunk_size]
+                                
+                                # Only send if chunk is substantial (skip tiny final chunks)
+                                if len(chunk) >= min_chunk_size:
+                                    pcm_chunk = struct.pack(f'<{len(chunk)}f', *chunk)
+                                    total_pcm_samples += len(chunk)
+                                    yield pcm_chunk
+                                else:
+                                    # Discard tiny final chunks to prevent noise
+                                    logger.debug(f"Discarding tiny chunk ({len(chunk)} samples) to prevent noise")
+                                    total_pcm_samples += len(chunk)  # Still count for logging
+                            
+                            # Successfully decoded - clear buffer and continue
+                            mp3_buffer = b""
+                            break
+                            
+                        except Exception as decode_error:
+                            # Decode failed - might be incomplete MP3 frame
+                            # If buffer is getting large, try with current data anyway
+                            if len(mp3_buffer) >= 16384:  # 16KB - likely complete by now
+                                attempts += 1
+                                if attempts >= max_attempts_per_chunk:
+                                    # Buffer the incomplete chunk for next iteration
+                                    break
+                            else:
+                                # Not enough data yet, wait for more chunks
+                                break
+                
+                # Process any remaining buffered MP3 data
+                if len(mp3_buffer) > 0:
+                    try:
+                        audio_segment = pydub.AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
+                        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+                        samples = audio_segment.get_array_of_samples()
+                        float_samples = [float(s) / 32768.0 for s in samples]
+                        
+                        # Only send if the final chunk is substantial (>= 1000 samples)
+                        # Tiny final chunks cause continuous clicking sounds
+                        min_chunk_size = 1000
+                        if len(float_samples) >= min_chunk_size:
+                            chunk_size = 10000
+                            for i in range(0, len(float_samples), chunk_size):
+                                chunk = float_samples[i:i + chunk_size]
+                                pcm_chunk = struct.pack(f'<{len(chunk)}f', *chunk)
+                                total_pcm_samples += len(chunk)
+                                yield pcm_chunk
+                        else:
+                            logger.debug(f"Skipping tiny final MP3 chunk ({len(float_samples)} samples) to prevent noise")
+                            total_pcm_samples += len(float_samples)  # Still count for logging
+                    except Exception as e:
+                        logger.warning(f"Failed to decode final MP3 chunk ({len(mp3_buffer)} bytes): {e}")
+                
+                logger.info(f"ElevenLabs streamed {total_mp3_bytes} bytes MP3, synthesized {total_pcm_samples} PCM samples in real-time")
+                return
+            # End ElevenLabs streaming block
+            elif model == "11lab":
+                # ElevenLabs requested but not available - fallback to OpenAI if available
+                logger.warning("ElevenLabs requested but not available, falling back to OpenAI")
+            
+            # OpenAI TTS (option or fallback - buffered, not real-time)
+            # Note: OpenAI TTS waits for complete response before sending (higher latency)
+            if (model == "openai" or model == "11lab") and settings.openai_api_key:
+                import openai
+                openai.api_key = settings.openai_api_key
+                
+                provider_type = "requested" if model == "openai" else "fallback"
+                logger.info(f"Using OpenAI TTS ({provider_type} - buffered mode)")
+                
+                # Call OpenAI TTS API
+                response = openai.audio.speech.create(
+                    model="tts-1",
+                    voice=voice_id if voice_id != "default" else "alloy",
+                    input=text
+                )
+                
+                audio_bytes = response.content
+                logger.info(f"OpenAI TTS generated {len(audio_bytes)} bytes of audio")
+                
+                # Decode MP3 to PCM
+                audio_segment = pydub.AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+                audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+                
+                # Convert to float32 PCM samples
+                samples = audio_segment.get_array_of_samples()
+                float_samples = [float(s) / 32768.0 for s in samples]
+                
+                # Yield in chunks of 10000 samples
+                # But skip tiny final chunks to prevent noise
+                chunk_size = 10000
+                min_chunk_size = 1000  # Don't send chunks smaller than this
+                
+                for i in range(0, len(float_samples), chunk_size):
+                    chunk = float_samples[i:i + chunk_size]
+                    # Only send if chunk is substantial (skip tiny final chunks)
+                    if len(chunk) >= min_chunk_size:
+                        pcm_chunk = struct.pack(f'<{len(chunk)}f', *chunk)
+                        yield pcm_chunk
+                    else:
+                        logger.debug(f"Skipping tiny final chunk ({len(chunk)} samples) to prevent noise")
+                
+                logger.info(f"Synthesized {len(float_samples)} samples to PCM (OpenAI)")
+                return
+            
+            # No TTS provider available
+            raise RuntimeError(f"TTS provider '{model}' not available and no fallback configured")
+                
+        except Exception as e:
+            logger.error(f"PCM synthesis failed: {e}")
+            raise
+
+    async def synthesize_text_to_pcm_bytes(self, text: str, voice_id: str = "default") -> bytes:
+        """
+        Synthesize text and return all PCM samples as bytes.
+        For use when we need the full audio before sending.
+        """
+        pcm_samples = []
+        async for chunk in self.synthesize_to_pcm(text, voice_id):
+            pcm_samples.append(chunk)
+        return b"".join(pcm_samples)
