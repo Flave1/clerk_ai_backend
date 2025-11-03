@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 
+from services.api.auth import get_current_user
 from services.api.dao import get_dao, DynamoDBDAO
 from shared.config import get_settings
 from shared.schemas import Meeting, MeetingSummary, MeetingStatus, MeetingPlatform, ActionItem
@@ -70,12 +71,14 @@ async def get_meetings(
     platform: Optional[MeetingPlatform] = None,
     limit: int = 50,
     offset: int = 0,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get list of meetings with optional filtering."""
+    """Get list of meetings for the authenticated user with optional filtering."""
     try:
-        # Query DynamoDB for meetings
-        meetings = await dao.get_meetings(limit=limit + offset)
+        # Query DynamoDB for meetings filtered by user_id
+        user_id = current_user["user_id"]
+        meetings = await dao.get_meetings(limit=limit + offset, user_id=user_id)
         
         # Add filtering logic
         if status:
@@ -195,14 +198,14 @@ async def bot_joined(
         # Update meeting if found/created
         if meeting:
             # Ensure bot_joined flag is set
-            setattr(meeting, "bot_joined", True)
+            meeting.bot_joined = True
             meeting.status = MeetingStatus.ACTIVE
             meeting.joined_at = datetime.utcnow()
             logger.info(
                 f"Updating meeting {meeting.id}: setting bot_joined=True, status=ACTIVE",
                 extra={
-                    "current_status": getattr(meeting, "status", None),
-                    "has_bot_joined": getattr(meeting, "bot_joined", None),
+                    "current_status": meeting.status,
+                    "has_bot_joined": meeting.bot_joined,
                 }
             )
             await dao.update_meeting(meeting)
@@ -368,12 +371,14 @@ async def generate_meeting_url(request: GenerateMeetingUrlRequest) -> GenerateMe
 
 @router.get("/active", response_model=List[Meeting])
 async def get_active_meetings(
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get list of currently active meetings."""
+    """Get list of currently active meetings for the authenticated user."""
     try:
-        # Query DynamoDB for meetings and filter for active ones
-        meetings = await dao.get_meetings(limit=100)
+        # Query DynamoDB for meetings filtered by user_id and filter for active ones
+        user_id = current_user["user_id"]
+        meetings = await dao.get_meetings(limit=100, user_id=user_id)
         active_meetings = [m for m in meetings if m.status == MeetingStatus.ACTIVE]
         
         return active_meetings
@@ -418,10 +423,11 @@ async def get_meeting_agent_status():
 @router.delete("/bulk")
 async def bulk_delete_meetings(
     meeting_ids: List[str],
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
     """
-    Delete multiple meetings at once.
+    Delete multiple meetings at once. Only accessible for user's own meetings.
     
     Args:
         meeting_ids: List of meeting IDs to delete
@@ -435,6 +441,15 @@ async def bulk_delete_meetings(
         
         for meeting_id in meeting_ids:
             try:
+                # Verify ownership before deletion
+                meeting = await dao.get_meeting(meeting_id)
+                if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+                    failed_deletions.append({
+                        "meeting_id": meeting_id,
+                        "error": "Access denied"
+                    })
+                    continue
+                
                 await dao.delete_meeting(meeting_id)
                 deleted_count += 1
                 logger.info(f"Deleted meeting: {meeting_id}")
@@ -460,15 +475,20 @@ async def bulk_delete_meetings(
 @router.get("/{meeting_id}", response_model=Meeting)
 async def get_meeting(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get a specific meeting by ID."""
+    """Get a specific meeting by ID. Only accessible by the owner."""
     try:
         # Query DynamoDB for the meeting
         meeting = await dao.get_meeting(str(meeting_id))
         
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
+        
+        # Verify ownership (allow if user_id is None for backward compatibility)
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
         return meeting
         
@@ -480,10 +500,15 @@ async def get_meeting(
 @router.get("/{meeting_id}/summary", response_model=MeetingSummary)
 async def get_meeting_summary(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get meeting summary by meeting ID."""
+    """Get meeting summary by meeting ID. Only accessible by the owner."""
     try:
+        # Verify ownership
+        meeting = await dao.get_meeting(str(meeting_id))
+        if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         # In a real implementation, you would query DynamoDB for the summary
         # For now, return a mock summary
         summary = MeetingSummary(
@@ -513,10 +538,11 @@ async def get_meeting_summary(
 async def join_meeting(
     meeting_id: UUID,
     background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
     """
-    Manually trigger joining a meeting with the bot.
+    Manually trigger joining a meeting with the bot. Only accessible by the owner.
     
     This endpoint:
     1. Gets meeting from database
@@ -534,6 +560,10 @@ async def join_meeting(
         
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
+        
+        # Verify ownership
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
         logger.info(f"🤖 Join request for meeting: {meeting.title} ({meeting.platform.value})")
         
@@ -728,10 +758,11 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
 @router.post("/{meeting_id}/leave")
 async def leave_meeting(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
     """
-    Manually trigger leaving a meeting and stopping transcription/summarization.
+    Manually trigger leaving a meeting and stopping transcription/summarization. Only accessible by the owner.
     
     This endpoint:
     1. Gets meeting from database
@@ -749,6 +780,10 @@ async def leave_meeting(
         
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
+        
+        # Verify ownership
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
         logger.info(f"📊 Meeting status: {meeting.status.value}")
         
@@ -795,13 +830,28 @@ async def send_meeting_notification(
     meeting_id: UUID,
     notification_type: str,
     background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Send notification for a meeting."""
+    """Send notification for a meeting. Only accessible by the owner."""
     try:
-        # Get meeting and summary
-        meeting = await get_meeting(meeting_id, dao)
-        summary = await get_meeting_summary(meeting_id, dao)
+        # Get meeting and verify ownership
+        meeting = await dao.get_meeting(str(meeting_id))
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Get meeting summary by calling DAO directly
+        # (Note: This is a simplified version; in production, you'd query the summaries table)
+        from shared.schemas import MeetingSummary, ActionItem
+        summary = MeetingSummary(
+            meeting_id=meeting_id,
+            topics_discussed=[],
+            key_decisions=[],
+            action_items=[],
+            summary_text="",
+        )
         
         # Send notification in background
         if notification_type == "summary":
@@ -823,12 +873,17 @@ async def send_meeting_notification(
 @router.get("/{meeting_id}/participants")
 async def get_meeting_participants(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get list of meeting participants."""
+    """Get list of meeting participants. Only accessible by the owner."""
     try:
-        # Get meeting
-        meeting = await get_meeting(meeting_id, dao)
+        # Get meeting and verify ownership
+        meeting = await dao.get_meeting(str(meeting_id))
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
         return {
             "meeting_id": meeting_id,
@@ -844,12 +899,17 @@ async def get_meeting_participants(
 @router.get("/{meeting_id}/transcription")
 async def get_meeting_transcription(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get meeting transcription."""
+    """Get meeting transcription. Only accessible by the owner."""
     try:
-        # Get meeting
-        meeting = await get_meeting(meeting_id, dao)
+        # Get meeting and verify ownership
+        meeting = await dao.get_meeting(str(meeting_id))
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
         return {
             "meeting_id": meeting_id,
@@ -866,14 +926,23 @@ async def get_meeting_transcription(
 @router.get("/{meeting_id}/action-items", response_model=List[ActionItem])
 async def get_meeting_action_items(
     meeting_id: UUID,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Get action items for a meeting."""
+    """Get action items for a meeting. Only accessible by the owner."""
     try:
-        # Get meeting summary
-        summary = await get_meeting_summary(meeting_id, dao)
+        # Verify ownership first
+        meeting = await dao.get_meeting(str(meeting_id))
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         
-        return summary.action_items
+        # Get action items from meeting summary if available
+        if meeting.summary and meeting.summary.action_items:
+            return meeting.summary.action_items
+        
+        return []
         
     except Exception as e:
         logger.error(f"Error getting action items for meeting {meeting_id}: {e}")
@@ -885,10 +954,15 @@ async def update_action_item(
     meeting_id: UUID,
     action_item_id: UUID,
     status: str,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao)
 ):
-    """Update action item status."""
+    """Update action item status. Only accessible by the owner."""
     try:
+        # Verify ownership
+        meeting = await dao.get_meeting(str(meeting_id))
+        if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
         # In a real implementation, you would update the action item in DynamoDB
         # For now, return success
         

@@ -79,7 +79,10 @@ class User(BaseModel):
     email: str
     name: str
     phone: Optional[str] = None
+    password_hash: Optional[str] = None  # Optional for OAuth users who login via Google/other providers
+    auth_provider: Optional[str] = None  # e.g., "google", "password", "microsoft"
     timezone: str = "UTC"
+    is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -115,7 +118,6 @@ class Action(BaseModel):
     """Action model for external integrations."""
 
     id: UUID = Field(default_factory=uuid4)
-    conversation_id: UUID
     turn_id: Optional[UUID] = None
     action_type: ActionType
     status: ActionStatus = ActionStatus.PENDING
@@ -263,6 +265,7 @@ class Meeting(BaseModel):
     """Meeting model for DynamoDB storage."""
     
     id: UUID = Field(default_factory=uuid4)
+    user_id: Optional[UUID] = None  # User who created/owns the meeting
     platform: MeetingPlatform
     meeting_url: str
     meeting_id_external: str  # External platform meeting ID
@@ -285,6 +288,7 @@ class Meeting(BaseModel):
     join_attempts: int = 0
     last_join_attempt: Optional[datetime] = None
     error_message: Optional[str] = None
+    bot_joined: bool = False  # Whether the bot has successfully joined the meeting
     
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -336,3 +340,39 @@ class CalendarEvent(BaseModel):
     platform: Optional[MeetingPlatform] = None
     calendar_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ApiKeyStatus(str, Enum):
+    """API Key status enumeration."""
+    
+    ACTIVE = "active"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class ApiKey(BaseModel):
+    """API Key model."""
+    
+    id: UUID = Field(default_factory=uuid4)
+    user_id: UUID
+    name: str
+    key_hash: str  # Hashed API key (never store plaintext)
+    key_prefix: str  # First 8 characters for display (e.g., "sk_live_...")
+    status: ApiKeyStatus = ApiKeyStatus.ACTIVE
+    last_used_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    scopes: List[str] = Field(default_factory=list)  # Permissions/scopes
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class JoinMeetingRequest(BaseModel):
+    """Join meeting webhook request payload."""
+    
+    meeting_url: str
+    type: str  # e.g., "zoom", "google_meet", "microsoft_teams"
+    transcript: bool = False
+    audio_record: bool = False
+    video_record: bool = False
+    voice_id: str
+    bot_name: str  # Name for the bot in the meeting

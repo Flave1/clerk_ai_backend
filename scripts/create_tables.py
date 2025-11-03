@@ -43,81 +43,14 @@ def create_dynamodb_tables():
         # Table configurations
         tables = [
         {
-            "TableName": f"{settings.dynamodb_table_prefix}{settings.conversations_table}",
-            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
-            "AttributeDefinitions": [
-                {"AttributeName": "id", "AttributeType": "S"},
-                {"AttributeName": "user_id", "AttributeType": "S"},
-                {"AttributeName": "started_at", "AttributeType": "S"},
-            ],
-            "GlobalSecondaryIndexes": [
-                {
-                    "IndexName": "user-id-index",
-                    "KeySchema": [
-                        {"AttributeName": "user_id", "KeyType": "HASH"},
-                        {"AttributeName": "started_at", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                    "ProvisionedThroughput": {
-                        "ReadCapacityUnits": 5,
-                        "WriteCapacityUnits": 5,
-                    },
-                }
-            ],
-            "ProvisionedThroughput": {
-                "ReadCapacityUnits": 5,
-                "WriteCapacityUnits": 5,
-            },
-        },
-        {
-            "TableName": f"{settings.dynamodb_table_prefix}{settings.turns_table}",
-            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
-            "AttributeDefinitions": [
-                {"AttributeName": "id", "AttributeType": "S"},
-                {"AttributeName": "conversation_id", "AttributeType": "S"},
-                {"AttributeName": "turn_number", "AttributeType": "N"},
-            ],
-            "GlobalSecondaryIndexes": [
-                {
-                    "IndexName": "conversation-id-index",
-                    "KeySchema": [
-                        {"AttributeName": "conversation_id", "KeyType": "HASH"},
-                        {"AttributeName": "turn_number", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                    "ProvisionedThroughput": {
-                        "ReadCapacityUnits": 5,
-                        "WriteCapacityUnits": 5,
-                    },
-                }
-            ],
-            "ProvisionedThroughput": {
-                "ReadCapacityUnits": 5,
-                "WriteCapacityUnits": 5,
-            },
-        },
-        {
             "TableName": f"{settings.dynamodb_table_prefix}{settings.actions_table}",
             "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
             "AttributeDefinitions": [
                 {"AttributeName": "id", "AttributeType": "S"},
-                {"AttributeName": "conversation_id", "AttributeType": "S"},
                 {"AttributeName": "action_type", "AttributeType": "S"},
                 {"AttributeName": "status", "AttributeType": "S"},
             ],
             "GlobalSecondaryIndexes": [
-                {
-                    "IndexName": "conversation-id-index",
-                    "KeySchema": [
-                        {"AttributeName": "conversation_id", "KeyType": "HASH"},
-                        {"AttributeName": "action_type", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                    "ProvisionedThroughput": {
-                        "ReadCapacityUnits": 5,
-                        "WriteCapacityUnits": 5,
-                    },
-                },
                 {
                     "IndexName": "status-index",
                     "KeySchema": [
@@ -137,6 +70,7 @@ def create_dynamodb_tables():
             },
         },
         {
+            # users_table: Supports id, email, first_name, last_name, and other user attributes
             "TableName": f"{settings.dynamodb_table_prefix}{settings.users_table}",
             "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
             "AttributeDefinitions": [
@@ -194,6 +128,7 @@ def create_dynamodb_tables():
                 {"AttributeName": "status", "AttributeType": "S"},
                 {"AttributeName": "start_time", "AttributeType": "S"},
                 {"AttributeName": "ai_email", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
             ],
             "GlobalSecondaryIndexes": [
                 {
@@ -212,6 +147,18 @@ def create_dynamodb_tables():
                     "IndexName": "ai-email-start-time-index",
                     "KeySchema": [
                         {"AttributeName": "ai_email", "KeyType": "HASH"},
+                        {"AttributeName": "start_time", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                },
+                {
+                    "IndexName": "user-id-start-time-index",
+                    "KeySchema": [
+                        {"AttributeName": "user_id", "KeyType": "HASH"},
                         {"AttributeName": "start_time", "KeyType": "RANGE"},
                     ],
                     "Projection": {"ProjectionType": "ALL"},
@@ -308,6 +255,45 @@ def create_dynamodb_tables():
                 "WriteCapacityUnits": 5,
             },
         },
+        {
+            "TableName": f"{settings.dynamodb_table_prefix}{settings.api_keys_table}",
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "status", "AttributeType": "S"},
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "user-id-index",
+                    "KeySchema": [
+                        {"AttributeName": "user_id", "KeyType": "HASH"},
+                        {"AttributeName": "id", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                },
+                {
+                    "IndexName": "status-index",
+                    "KeySchema": [
+                        {"AttributeName": "status", "KeyType": "HASH"},
+                        {"AttributeName": "id", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                },
+            ],
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        },
 ]
 
 
@@ -375,8 +361,6 @@ def delete_dynamodb_tables():
 
         # List of tables to delete
         table_names = [
-            f"{settings.dynamodb_table_prefix}{settings.conversations_table}",
-            f"{settings.dynamodb_table_prefix}{settings.turns_table}",
             f"{settings.dynamodb_table_prefix}{settings.actions_table}",
             f"{settings.dynamodb_table_prefix}{settings.users_table}",
             f"{settings.dynamodb_table_prefix}rooms",
@@ -384,6 +368,7 @@ def delete_dynamodb_tables():
             f"{settings.dynamodb_table_prefix}{settings.meeting_summaries_table}",
             f"{settings.dynamodb_table_prefix}{settings.meeting_transcriptions_table}",
             f"{settings.dynamodb_table_prefix}{settings.meeting_notifications_table}",
+            f"{settings.dynamodb_table_prefix}{settings.api_keys_table}",
         ]
 
         for table_name in table_names:

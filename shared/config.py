@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     meeting_summaries_table: str = "meeting_summaries"
     meeting_transcriptions_table: str = "meeting_transcriptions"
     meeting_notifications_table: str = "meeting_notifications"
+    api_keys_table: str = "api_keys"
 
     # SQS/SNS
     sqs_queue_prefix: str = "clerk_"

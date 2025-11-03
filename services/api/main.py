@@ -15,7 +15,7 @@ from shared.config import get_settings
 from .dao import DynamoDBDAO, set_dao_instance
 # from .routes import actions, conversations, rooms, meetings
 # from .ws import ConnectionManager
-from services.api.routes import actions, conversations, rooms, meetings
+from services.api.routes import actions, auth, rooms, meetings, api_keys, webhooks
 from services.api.ws import ConnectionManager
 
 # Configure logging
@@ -70,9 +70,9 @@ app.add_middleware(
 
 # Include routers
 app.include_router(
-    conversations.router,
-    prefix=f"{settings.api_prefix}/conversations",
-    tags=["conversations"],
+    auth.router,
+    prefix=f"{settings.api_prefix}/auth",
+    tags=["authentication"],
 )
 
 app.include_router(
@@ -82,6 +82,18 @@ app.include_router(
 app.include_router(rooms.router, prefix=f"{settings.api_prefix}/rooms", tags=["rooms"])
 
 app.include_router(meetings.router, prefix=f"{settings.api_prefix}/meetings", tags=["meetings"])
+
+app.include_router(
+    api_keys.router,
+    prefix=f"{settings.api_prefix}/api-keys",
+    tags=["api-keys"],
+)
+
+app.include_router(
+    webhooks.router,
+    prefix="/v1/api.auray.net",
+    tags=["webhooks"],
+)
 
 
 @app.get("/health")

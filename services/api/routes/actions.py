@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from shared.schemas import Action, ActionStatus, ActionType
 
+from ..auth import get_current_user
 from ..dao import DynamoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,6 @@ class ActionResponse(BaseModel):
     """Action response model."""
 
     id: str
-    conversation_id: str
     turn_id: Optional[str]
     action_type: str
     status: str
@@ -42,17 +42,16 @@ class ActionUpdate(BaseModel):
 
 @router.get("/", response_model=List[ActionResponse])
 async def get_actions(
-    conversation_id: Optional[str] = Query(None),
     action_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     limit: int = Query(50, le=100),
     offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Get list of actions."""
+    """Get list of actions for the authenticated user."""
     try:
         actions = await dao.get_actions(
-            conversation_id=conversation_id,
             action_type=action_type,
             status=status,
             limit=limit,
@@ -64,7 +63,6 @@ async def get_actions(
             response.append(
                 ActionResponse(
                     id=str(action.id),
-                    conversation_id=str(action.conversation_id),
                     turn_id=str(action.turn_id) if action.turn_id else None,
                     action_type=action.action_type.value,
                     status=action.status.value,
@@ -86,7 +84,11 @@ async def get_actions(
 
 
 @router.get("/{action_id}", response_model=ActionResponse)
-async def get_action(action_id: str, dao: DynamoDBDAO = Depends(get_dao)):
+async def get_action(
+    action_id: str,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
     """Get a specific action."""
     try:
         action = await dao.get_action(action_id)
@@ -95,7 +97,6 @@ async def get_action(action_id: str, dao: DynamoDBDAO = Depends(get_dao)):
 
         return ActionResponse(
             id=str(action.id),
-            conversation_id=str(action.conversation_id),
             turn_id=str(action.turn_id) if action.turn_id else None,
             action_type=action.action_type.value,
             status=action.status.value,
@@ -117,7 +118,10 @@ async def get_action(action_id: str, dao: DynamoDBDAO = Depends(get_dao)):
 
 @router.put("/{action_id}", response_model=ActionResponse)
 async def update_action(
-    action_id: str, update: ActionUpdate, dao: DynamoDBDAO = Depends(get_dao)
+    action_id: str,
+    update: ActionUpdate,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
 ):
     """Update an action."""
     try:
@@ -145,7 +149,6 @@ async def update_action(
 
         return ActionResponse(
             id=str(updated_action.id),
-            conversation_id=str(updated_action.conversation_id),
             turn_id=str(updated_action.turn_id) if updated_action.turn_id else None,
             action_type=updated_action.action_type.value,
             status=updated_action.status.value,
@@ -162,43 +165,4 @@ async def update_action(
         raise
     except Exception as e:
         logger.error(f"Failed to update action {action_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/conversation/{conversation_id}", response_model=List[ActionResponse])
-async def get_conversation_actions(
-    conversation_id: str,
-    limit: int = Query(50, le=100),
-    offset: int = Query(0, ge=0),
-    dao: DynamoDBDAO = Depends(get_dao),
-):
-    """Get actions for a specific conversation."""
-    try:
-        actions = await dao.get_actions(
-            conversation_id=conversation_id, limit=limit, offset=offset
-        )
-
-        response = []
-        for action in actions:
-            response.append(
-                ActionResponse(
-                    id=str(action.id),
-                    conversation_id=str(action.conversation_id),
-                    turn_id=str(action.turn_id) if action.turn_id else None,
-                    action_type=action.action_type.value,
-                    status=action.status.value,
-                    parameters=action.parameters,
-                    result=action.result,
-                    error_message=action.error_message,
-                    created_at=action.created_at.isoformat(),
-                    completed_at=action.completed_at.isoformat()
-                    if action.completed_at
-                    else None,
-                )
-            )
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Failed to get conversation actions: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -13,8 +13,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from shared.config import get_settings
-from shared.schemas import (Action, ActionStatus, Conversation,
-                            ConversationStatus, RoomInfo, Turn, User, Meeting)
+from shared.schemas import (Action, ActionStatus, RoomInfo, User, Meeting, ApiKey, ApiKeyStatus)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -25,12 +24,11 @@ class DynamoDBDAO:
 
     def __init__(self):
         self.dynamodb = None
-        self.conversations_table = None
-        self.turns_table = None
         self.actions_table = None
         self.users_table = None
         self.rooms_table = None
         self.meetings_table = None
+        self.api_keys_table = None
         self.initialized = False
 
     async def initialize(self):
@@ -54,12 +52,6 @@ class DynamoDBDAO:
                 logger.info("🏠 DynamoDB: Connected to Local (OFFLINE)")
 
             # Get table references
-            self.conversations_table = self.dynamodb.Table(
-                f"{settings.dynamodb_table_prefix}{settings.conversations_table}"
-            )
-            self.turns_table = self.dynamodb.Table(
-                f"{settings.dynamodb_table_prefix}{settings.turns_table}"
-            )
             self.actions_table = self.dynamodb.Table(
                 f"{settings.dynamodb_table_prefix}{settings.actions_table}"
             )
@@ -72,6 +64,9 @@ class DynamoDBDAO:
             self.meetings_table = self.dynamodb.Table(
                 f"{settings.dynamodb_table_prefix}meetings"
             )
+            self.api_keys_table = self.dynamodb.Table(
+                f"{settings.dynamodb_table_prefix}{settings.api_keys_table}"
+            )
 
             self.initialized = True
             logger.info("DynamoDB DAO initialized successfully")
@@ -80,211 +75,9 @@ class DynamoDBDAO:
             logger.error(f"Failed to initialize DynamoDB DAO: {e}")
             raise
 
-    # Conversation operations
-    async def create_conversation(self, conversation: Conversation) -> Conversation:
-        """Create a new conversation."""
-        try:
-            item = {
-                "id": str(conversation.id),
-                "user_id": str(conversation.user_id),
-                "room_id": conversation.room_id,
-                "status": conversation.status.value,
-                "started_at": conversation.started_at.isoformat(),
-                "ended_at": conversation.ended_at.isoformat()
-                if conversation.ended_at
-                else None,
-                "summary": conversation.summary,
-                "metadata": json.dumps(conversation.metadata),
-            }
-
-            self.conversations_table.put_item(Item=item)
-            logger.info(f"Created conversation: {conversation.id}")
-            return conversation
-
-        except Exception as e:
-            logger.error(f"Failed to create conversation: {e}")
-            raise
-
-    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        """Get a conversation by ID."""
-        try:
-            response = self.conversations_table.get_item(Key={"id": conversation_id})
-
-            if "Item" not in response:
-                return None
-
-            item = response["Item"]
-            return Conversation(
-                id=UUID(item["id"]),
-                user_id=UUID(item["user_id"]),
-                room_id=item["room_id"],
-                status=ConversationStatus(item["status"]),
-                started_at=datetime.fromisoformat(item["started_at"]),
-                ended_at=datetime.fromisoformat(item["ended_at"])
-                if item.get("ended_at")
-                else None,
-                summary=item.get("summary"),
-                metadata=json.loads(item.get("metadata", "{}")),
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to get conversation {conversation_id}: {e}")
-            raise
-
-    async def get_conversations(
-        self,
-        user_id: Optional[str] = None,
-        status: Optional[str] = None,
-        limit: int = 10,
-        offset: int = 0,
-    ) -> List[Conversation]:
-        """Get conversations with filtering."""
-        try:
-            conversations = []
-
-            if user_id:
-                # Use GSI for user_id query
-                response = self.conversations_table.query(
-                    IndexName="user-id-index",
-                    KeyConditionExpression=Key("user_id").eq(user_id),
-                    ScanIndexForward=False,  # Sort by started_at descending
-                    Limit=limit,
-                )
-            else:
-                # Scan all conversations
-                scan_params = {"Limit": limit}
-                if offset > 0:
-                    scan_params["ExclusiveStartKey"] = {"id": str(offset)}
-                
-                response = self.conversations_table.scan(**scan_params)
-
-            for item in response.get("Items", []):
-                if status and item["status"] != status:
-                    continue
-
-                conversation = Conversation(
-                    id=UUID(item["id"]),
-                    user_id=UUID(item["user_id"]),
-                    room_id=item["room_id"],
-                    status=ConversationStatus(item["status"]),
-                    started_at=datetime.fromisoformat(item["started_at"]),
-                    ended_at=datetime.fromisoformat(item["ended_at"])
-                    if item.get("ended_at")
-                    else None,
-                    summary=item.get("summary"),
-                    metadata=json.loads(item.get("metadata", "{}")),
-                )
-                conversations.append(conversation)
-
-            return conversations
-
-        except Exception as e:
-            logger.error(f"Failed to get conversations: {e}")
-            raise
-
-    async def update_conversation(self, conversation: Conversation) -> Conversation:
-        """Update a conversation."""
-        try:
-            item = {
-                "id": str(conversation.id),
-                "user_id": str(conversation.user_id),
-                "room_id": conversation.room_id,
-                "status": conversation.status.value,
-                "started_at": conversation.started_at.isoformat(),
-                "ended_at": conversation.ended_at.isoformat()
-                if conversation.ended_at
-                else None,
-                "summary": conversation.summary,
-                "metadata": json.dumps(conversation.metadata),
-            }
-
-            self.conversations_table.put_item(Item=item)
-            logger.info(f"Updated conversation: {conversation.id}")
-            return conversation
-
-        except Exception as e:
-            logger.error(f"Failed to update conversation: {e}")
-            raise
-
-    async def delete_conversation(self, conversation_id: str):
-        """Delete a conversation and related data."""
-        try:
-            # Delete conversation
-            self.conversations_table.delete_item(Key={"id": conversation_id})
-
-            # Delete related turns
-            turns = await self.get_conversation_turns(conversation_id, limit=1000)
-            for turn in turns:
-                self.turns_table.delete_item(Key={"id": str(turn.id)})
-
-            # Delete related actions
-            actions = await self.get_actions(
-                conversation_id=conversation_id, limit=1000
-            )
-            for action in actions:
-                self.actions_table.delete_item(Key={"id": str(action.id)})
-
-            logger.info(f"Deleted conversation and related data: {conversation_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to delete conversation: {e}")
-            raise
-
-    # Turn operations
-    async def get_conversation_turns(
-        self, conversation_id: str, limit: int = 100, offset: int = 0
-    ) -> List[Turn]:
-        """Get turns for a conversation."""
-        try:
-            # Use scan with filter since the table schema might not support query on conversation_id
-            response = self.turns_table.scan(
-                FilterExpression=Attr("conversation_id").eq(conversation_id),
-                Limit=limit,
-            )
-
-            turns = []
-            for item in response.get("Items", []):
-                try:
-                    turn = Turn(
-                        id=UUID(item["id"]),
-                        conversation_id=UUID(item["conversation_id"]),
-                        turn_number=item["turn_number"],
-                        turn_type=item["turn_type"],
-                        content=item["content"],
-                        audio_url=item.get("audio_url"),
-                        confidence_score=item.get("confidence_score"),
-                        timestamp=datetime.fromisoformat(item["timestamp"]),
-                        metadata=json.loads(item.get("metadata", "{}")),
-                    )
-                    turns.append(turn)
-                except Exception as turn_error:
-                    logger.warning(f"Failed to parse turn {item.get('id', 'unknown')}: {turn_error}")
-                    continue
-
-            # Sort by turn_number since scan doesn't guarantee order
-            turns.sort(key=lambda t: t.turn_number)
-            return turns
-
-        except Exception as e:
-            logger.error(f"Failed to get conversation turns: {e}")
-            return []  # Return empty list instead of raising to avoid breaking the dashboard
-
-    async def get_turn_count(self, conversation_id: str) -> int:
-        """Get turn count for a conversation."""
-        try:
-            response = self.turns_table.scan(
-                FilterExpression=Attr("conversation_id").eq(conversation_id),
-                Select="COUNT",
-            )
-            return response.get("Count", 0)
-        except Exception as e:
-            logger.error(f"Failed to get turn count: {e}")
-            return 0
-
     # Action operations
     async def get_actions(
         self,
-        conversation_id: Optional[str] = None,
         action_type: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 50,
@@ -292,10 +85,7 @@ class DynamoDBDAO:
     ) -> List[Action]:
         """Get actions with filtering."""
         try:
-            # Use scan with filter since the table schema might not support query on conversation_id
             scan_params = {"Limit": limit}
-            if conversation_id:
-                scan_params["FilterExpression"] = Attr("conversation_id").eq(conversation_id)
             
             if offset > 0:
                 scan_params["ExclusiveStartKey"] = {"id": str(offset)}
@@ -311,7 +101,6 @@ class DynamoDBDAO:
 
                 action = Action(
                     id=UUID(item["id"]),
-                    conversation_id=UUID(item["conversation_id"]),
                     turn_id=UUID(item["turn_id"]) if item.get("turn_id") else None,
                     action_type=item["action_type"],
                     status=ActionStatus(item["status"]),
@@ -342,7 +131,6 @@ class DynamoDBDAO:
             item = response["Item"]
             return Action(
                 id=UUID(item["id"]),
-                conversation_id=UUID(item["conversation_id"]),
                 turn_id=UUID(item["turn_id"]) if item.get("turn_id") else None,
                 action_type=item["action_type"],
                 status=ActionStatus(item["status"]),
@@ -364,7 +152,6 @@ class DynamoDBDAO:
         try:
             item = {
                 "id": str(action.id),
-                "conversation_id": str(action.conversation_id),
                 "turn_id": str(action.turn_id) if action.turn_id else None,
                 "action_type": action.action_type.value,
                 "status": action.status.value,
@@ -495,6 +282,7 @@ class DynamoDBDAO:
 
             item = {
                 "id": str(meeting.id),
+                "user_id": str(meeting.user_id) if meeting.user_id else "",
                 "platform": meeting.platform.value,
                 "meeting_url": meeting.meeting_url,
                 "meeting_id_external": meeting.meeting_id_external,
@@ -520,6 +308,7 @@ class DynamoDBDAO:
                 "audio_enabled": meeting.audio_enabled,
                 "video_enabled": meeting.video_enabled,
                 "recording_enabled": meeting.recording_enabled,
+                "bot_joined": meeting.bot_joined,
             }
 
             self.meetings_table.put_item(Item=item)
@@ -545,13 +334,24 @@ class DynamoDBDAO:
             logger.error(f"Failed to get meeting: {e}")
             raise
 
-    async def get_meetings(self, limit: int = 10) -> List[Meeting]:
-        """Get meetings with pagination."""
+    async def get_meetings(self, limit: int = 10, user_id: Optional[str] = None) -> List[Meeting]:
+        """Get meetings with pagination. Optionally filter by user_id."""
         try:
-            response = self.meetings_table.scan(Limit=limit)
-            meetings = []
+            if user_id:
+                # Use GSI to query by user_id
+                response = self.meetings_table.query(
+                    IndexName="user-id-start-time-index",
+                    KeyConditionExpression=Key("user_id").eq(user_id),
+                    ScanIndexForward=False,  # Sort by start_time descending
+                    Limit=limit
+                )
+                items = response.get("Items", [])
+            else:
+                response = self.meetings_table.scan(Limit=limit)
+                items = response.get("Items", [])
             
-            for item in response.get("Items", []):
+            meetings = []
+            for item in items:
                 meetings.append(self._item_to_meeting(item))
             
             return meetings
@@ -636,6 +436,7 @@ class DynamoDBDAO:
             # Prepare update data
             item = {
                 "id": str(meeting.id),
+                "user_id": str(meeting.user_id) if meeting.user_id else "",
                 "platform": meeting.platform.value,
                 "meeting_url": meeting.meeting_url,
                 "meeting_id_external": meeting.meeting_id_external,
@@ -654,6 +455,7 @@ class DynamoDBDAO:
                 "join_attempts": meeting.join_attempts,
                 "last_join_attempt": meeting.last_join_attempt.isoformat() if meeting.last_join_attempt else None,
                 "error_message": meeting.error_message or "",
+                "bot_joined": meeting.bot_joined,
                 "created_at": meeting.created_at.isoformat(),
                 "updated_at": meeting.updated_at.isoformat(),
                 "joined_at": meeting.joined_at.isoformat() if meeting.joined_at else None,
@@ -729,6 +531,7 @@ class DynamoDBDAO:
 
         return Meeting(
             id=item["id"],
+            user_id=UUID(item["user_id"]) if item.get("user_id") else None,
             platform=MeetingPlatform(item["platform"]),
             meeting_url=item["meeting_url"],
             meeting_id_external=item["meeting_id_external"],
@@ -754,6 +557,7 @@ class DynamoDBDAO:
             audio_enabled=item.get("audio_enabled", True),
             video_enabled=item.get("video_enabled", False),
             recording_enabled=item.get("recording_enabled", False),
+            bot_joined=item.get("bot_joined", False),
         )
 
     async def add_meeting_participant(self, meeting_id: str, participant: Dict[str, Any]) -> bool:
@@ -853,6 +657,376 @@ class DynamoDBDAO:
         except Exception as e:
             logger.error(f"Error getting meeting participants: {e}")
             return []
+
+    # User operations
+    async def create_user(self, user: User) -> User:
+        """Create a new user."""
+        try:
+            if not self.users_table:
+                raise RuntimeError("Users table not initialized")
+            
+            # Check if user with this email already exists
+            existing_user = await self.get_user_by_email(user.email)
+            if existing_user:
+                raise ValueError(f"User with email {user.email} already exists")
+            
+            item = {
+                "id": str(user.id),
+                "email": user.email,
+                "name": user.name,
+                "phone": user.phone or "",
+                "password_hash": user.password_hash or "",
+                "auth_provider": user.auth_provider or "",
+                "timezone": user.timezone,
+                "is_active": user.is_active,
+                "created_at": user.created_at.isoformat(),
+                "updated_at": user.updated_at.isoformat(),
+            }
+            
+            self.users_table.put_item(Item=item)
+            logger.info(f"Created user: {user.id} ({user.email})")
+            return user
+
+        except Exception as e:
+            logger.error(f"Failed to create user: {e}")
+            raise
+
+    async def get_user_by_id(self, user_id: str) -> Optional[User]:
+        """Get a user by ID."""
+        try:
+            if not self.users_table:
+                raise RuntimeError("Users table not initialized")
+            
+            response = self.users_table.get_item(Key={"id": user_id})
+            
+            if "Item" not in response:
+                return None
+            
+            item = response["Item"]
+            return User(
+                id=UUID(item["id"]),
+                email=item["email"],
+                name=item["name"],
+                phone=item.get("phone") or None,
+                password_hash=item.get("password_hash") or None,
+                auth_provider=item.get("auth_provider") or None,
+                timezone=item.get("timezone", "UTC"),
+                is_active=item.get("is_active", True),
+                created_at=datetime.fromisoformat(item["created_at"]),
+                updated_at=datetime.fromisoformat(item["updated_at"]),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get user {user_id}: {e}")
+            raise
+
+    async def get_user_by_email(self, email: str) -> Optional[User]:
+        """Get a user by email using GSI."""
+        try:
+            if not self.users_table:
+                raise RuntimeError("Users table not initialized")
+            
+            response = self.users_table.query(
+                IndexName="email-index",
+                KeyConditionExpression=Key("email").eq(email),
+                Limit=1
+            )
+            
+            if not response.get("Items"):
+                return None
+            
+            item = response["Items"][0]
+            return User(
+                id=UUID(item["id"]),
+                email=item["email"],
+                name=item["name"],
+                phone=item.get("phone") or None,
+                password_hash=item["password_hash"],
+                timezone=item.get("timezone", "UTC"),
+                is_active=item.get("is_active", True),
+                created_at=datetime.fromisoformat(item["created_at"]),
+                updated_at=datetime.fromisoformat(item["updated_at"]),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get user by email {email}: {e}")
+            raise
+
+    async def update_user(self, user: User) -> User:
+        """Update a user."""
+        try:
+            if not self.users_table:
+                raise RuntimeError("Users table not initialized")
+            
+            # Check if user exists
+            existing = await self.get_user_by_id(str(user.id))
+            if not existing:
+                raise ValueError(f"User {user.id} not found")
+            
+            item = {
+                "id": str(user.id),
+                "email": user.email,
+                "name": user.name,
+                "phone": user.phone or "",
+                "password_hash": user.password_hash or "",
+                "auth_provider": user.auth_provider or "",
+                "timezone": user.timezone,
+                "is_active": user.is_active,
+                "created_at": existing.created_at.isoformat(),  # Preserve original
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            
+            self.users_table.put_item(Item=item)
+            logger.info(f"Updated user: {user.id}")
+            return user
+
+        except Exception as e:
+            logger.error(f"Failed to update user: {e}")
+            raise
+
+    # API Key operations
+    async def create_api_key(self, api_key: ApiKey) -> ApiKey:
+        """Create a new API key."""
+        try:
+            if not self.api_keys_table:
+                raise RuntimeError("API keys table not initialized")
+            
+            item = {
+                "id": str(api_key.id),
+                "user_id": str(api_key.user_id),
+                "name": api_key.name,
+                "key_hash": api_key.key_hash,
+                "key_prefix": api_key.key_prefix,
+                "status": api_key.status.value,
+                "last_used_at": api_key.last_used_at.isoformat() if api_key.last_used_at else None,
+                "expires_at": api_key.expires_at.isoformat() if api_key.expires_at else None,
+                "scopes": json.dumps(api_key.scopes),
+                "created_at": api_key.created_at.isoformat(),
+                "updated_at": api_key.updated_at.isoformat(),
+            }
+            
+            self.api_keys_table.put_item(Item=item)
+            logger.info(f"Created API key: {api_key.id} for user {api_key.user_id}")
+            return api_key
+
+        except Exception as e:
+            logger.error(f"Failed to create API key: {e}")
+            raise
+
+    async def get_api_keys_by_user(self, user_id: str) -> List[ApiKey]:
+        """Get all API keys for a user."""
+        try:
+            if not self.api_keys_table:
+                raise RuntimeError("API keys table not initialized")
+            
+            response = self.api_keys_table.query(
+                IndexName="user-id-index",
+                KeyConditionExpression=Key("user_id").eq(user_id),
+                ScanIndexForward=False,  # Sort by created_at descending
+            )
+            
+            api_keys = []
+            for item in response.get("Items", []):
+                api_key = ApiKey(
+                    id=UUID(item["id"]),
+                    user_id=UUID(item["user_id"]),
+                    name=item["name"],
+                    key_hash=item["key_hash"],
+                    key_prefix=item["key_prefix"],
+                    status=ApiKeyStatus(item["status"]),
+                    last_used_at=datetime.fromisoformat(item["last_used_at"]) if item.get("last_used_at") else None,
+                    expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
+                    scopes=json.loads(item.get("scopes", "[]")),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                    updated_at=datetime.fromisoformat(item["updated_at"]),
+                )
+                api_keys.append(api_key)
+            
+            return api_keys
+
+        except Exception as e:
+            logger.error(f"Failed to get API keys for user {user_id}: {e}")
+            raise
+
+    async def get_api_key_by_id(self, api_key_id: str) -> Optional[ApiKey]:
+        """Get an API key by ID."""
+        try:
+            if not self.api_keys_table:
+                raise RuntimeError("API keys table not initialized")
+            
+            response = self.api_keys_table.get_item(Key={"id": api_key_id})
+            
+            if "Item" not in response:
+                return None
+            
+            item = response["Item"]
+            return ApiKey(
+                id=UUID(item["id"]),
+                user_id=UUID(item["user_id"]),
+                name=item["name"],
+                key_hash=item["key_hash"],
+                key_prefix=item["key_prefix"],
+                status=ApiKeyStatus(item["status"]),
+                last_used_at=datetime.fromisoformat(item["last_used_at"]) if item.get("last_used_at") else None,
+                expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
+                scopes=json.loads(item.get("scopes", "[]")),
+                created_at=datetime.fromisoformat(item["created_at"]),
+                updated_at=datetime.fromisoformat(item["updated_at"]),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get API key {api_key_id}: {e}")
+            raise
+
+    async def validate_api_key(self, api_key_token: str) -> Optional[ApiKey]:
+        """Validate an API key token and return the ApiKey if valid."""
+        try:
+            if not self.api_keys_table:
+                logger.error("API keys table not initialized")
+                raise RuntimeError("API keys table not initialized")
+            
+            # Extract prefix from token (e.g., "sk_live_12345678...")
+            if not api_key_token.startswith("sk_"):
+                logger.debug("API key token doesn't start with 'sk_'")
+                return None
+            
+            # Try to extract prefix (first 12 chars: "sk_live_1234")
+            prefix = api_key_token[:12]
+            logger.info(f"Looking for API key with prefix: {prefix}")
+            logger.info(f"Full token length: {len(api_key_token)}")
+            logger.info(f"Full token (first 20 chars): {api_key_token[:20]}")
+            
+            # Scan for keys with matching prefix
+            response = self.api_keys_table.scan(
+                FilterExpression=Attr("key_prefix").eq(prefix),
+            )
+            
+            items = response.get("Items", [])
+            logger.info(f"Found {len(items)} API keys with prefix {prefix}")
+            
+            # Log all found prefixes for debugging
+            if items:
+                for item in items:
+                    logger.info(f"Found key: id={item.get('id')}, prefix={item.get('key_prefix')}, status={item.get('status')}")
+            else:
+                # If no items found, let's check what prefixes exist
+                logger.warning(f"No keys found with prefix '{prefix}'. Checking all keys...")
+                all_keys_response = self.api_keys_table.scan()
+                all_items = all_keys_response.get("Items", [])
+                logger.warning(f"Total API keys in database: {len(all_items)}")
+                for item in all_items[:5]:  # Log first 5
+                    logger.warning(f"  Existing key prefix: {item.get('key_prefix')} (id: {item.get('id')})")
+            
+            if len(items) == 0:
+                logger.warning(f"No API keys found with prefix {prefix}")
+                return None
+            
+            # Verify the key hash matches
+            from .auth import verify_password
+            
+            for item in items:
+                key_hash = item["key_hash"]
+                key_id = item.get("id", "unknown")
+                stored_prefix = item.get("key_prefix", "unknown")
+                logger.info(f"Verifying API key {key_id} (stored prefix: {stored_prefix})...")
+                
+                # For API keys, we use bcrypt-like verification
+                verification_result = verify_password(api_key_token, key_hash)
+                logger.info(f"Password verification result for key {key_id}: {verification_result}")
+                
+                if verification_result:
+                    logger.info(f"Password verification successful for key {key_id}")
+                    api_key = ApiKey(
+                        id=UUID(item["id"]),
+                        user_id=UUID(item["user_id"]),
+                        name=item["name"],
+                        key_hash=item["key_hash"],
+                        key_prefix=item["key_prefix"],
+                        status=ApiKeyStatus(item["status"]),
+                        last_used_at=datetime.fromisoformat(item["last_used_at"]) if item.get("last_used_at") else None,
+                        expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
+                        scopes=json.loads(item.get("scopes", "[]")),
+                        created_at=datetime.fromisoformat(item["created_at"]),
+                        updated_at=datetime.fromisoformat(item["updated_at"]),
+                    )
+                    
+                    # Check if key is active and not expired
+                    if api_key.status != ApiKeyStatus.ACTIVE:
+                        logger.warning(f"API key {key_id} is not active (status: {api_key.status})")
+                        return None
+                    
+                    if api_key.expires_at and api_key.expires_at < datetime.utcnow():
+                        logger.warning(f"API key {key_id} is expired")
+                        # Mark as expired
+                        api_key.status = ApiKeyStatus.EXPIRED
+                        await self.update_api_key(api_key)
+                        return None
+                    
+                    logger.info(f"API key {key_id} validated successfully")
+                    # Update last_used_at
+                    api_key.last_used_at = datetime.utcnow()
+                    await self.update_api_key(api_key)
+                    
+                    return api_key
+                else:
+                    logger.warning(f"Password verification failed for key {key_id} (stored prefix: {stored_prefix})")
+            
+            logger.warning(f"None of the {len(items)} API keys with prefix {prefix} matched the provided token")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to validate API key: {e}", exc_info=True)
+            return None
+
+    async def update_api_key(self, api_key: ApiKey) -> ApiKey:
+        """Update an API key."""
+        try:
+            if not self.api_keys_table:
+                raise RuntimeError("API keys table not initialized")
+            
+            item = {
+                "id": str(api_key.id),
+                "user_id": str(api_key.user_id),
+                "name": api_key.name,
+                "key_hash": api_key.key_hash,
+                "key_prefix": api_key.key_prefix,
+                "status": api_key.status.value,
+                "last_used_at": api_key.last_used_at.isoformat() if api_key.last_used_at else None,
+                "expires_at": api_key.expires_at.isoformat() if api_key.expires_at else None,
+                "scopes": json.dumps(api_key.scopes),
+                "created_at": api_key.created_at.isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            
+            self.api_keys_table.put_item(Item=item)
+            logger.info(f"Updated API key: {api_key.id}")
+            return api_key
+
+        except Exception as e:
+            logger.error(f"Failed to update API key: {e}")
+            raise
+
+    async def delete_api_key(self, api_key_id: str, user_id: str) -> bool:
+        """Delete an API key. Only the owner can delete it."""
+        try:
+            if not self.api_keys_table:
+                raise RuntimeError("API keys table not initialized")
+            
+            # Verify ownership
+            api_key = await self.get_api_key_by_id(api_key_id)
+            if not api_key:
+                return False
+            
+            if str(api_key.user_id) != user_id:
+                return False
+            
+            self.api_keys_table.delete_item(Key={"id": api_key_id})
+            logger.info(f"Deleted API key: {api_key_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to delete API key {api_key_id}: {e}")
+            raise
 
 
 # Dependency injection

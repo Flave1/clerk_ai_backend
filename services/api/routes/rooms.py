@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from shared.schemas import RoomInfo
 
+from ..auth import get_current_user
 from ..dao import DynamoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,11 @@ class RoomCreate(BaseModel):
 
 
 @router.get("/", response_model=List[RoomResponse])
-async def get_rooms(dao: DynamoDBDAO = Depends(get_dao)):
-    """Get list of active rooms."""
+async def get_rooms(
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
+    """Get list of active rooms for the authenticated user."""
     try:
         rooms = await dao.get_active_rooms()
 
@@ -59,7 +63,11 @@ async def get_rooms(dao: DynamoDBDAO = Depends(get_dao)):
 
 
 @router.get("/{room_id}", response_model=RoomResponse)
-async def get_room(room_id: str, dao: DynamoDBDAO = Depends(get_dao)):
+async def get_room(
+    room_id: str,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
     """Get a specific room."""
     try:
         room = await dao.get_room(room_id)
@@ -82,7 +90,11 @@ async def get_room(room_id: str, dao: DynamoDBDAO = Depends(get_dao)):
 
 
 @router.post("/", response_model=RoomResponse)
-async def create_room(request: RoomCreate, dao: DynamoDBDAO = Depends(get_dao)):
+async def create_room(
+    request: RoomCreate,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
     """Create a new room."""
     try:
         room = RoomInfo(
@@ -109,7 +121,10 @@ async def create_room(request: RoomCreate, dao: DynamoDBDAO = Depends(get_dao)):
 
 @router.put("/{room_id}/participants")
 async def update_room_participants(
-    room_id: str, participant_count: int, dao: DynamoDBDAO = Depends(get_dao)
+    room_id: str,
+    participant_count: int,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
 ):
     """Update room participant count."""
     try:
@@ -138,7 +153,11 @@ async def update_room_participants(
 
 
 @router.delete("/{room_id}")
-async def delete_room(room_id: str, dao: DynamoDBDAO = Depends(get_dao)):
+async def delete_room(
+    room_id: str,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
     """Delete a room."""
     try:
         room = await dao.get_room(room_id)

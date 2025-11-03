@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from shared.schemas import Conversation, ConversationStatus, Turn
 
+from ..auth import get_current_user
 from ..dao import DynamoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
@@ -54,14 +55,16 @@ class TurnResponse(BaseModel):
 
 @router.get("/", response_model=List[ConversationResponse])
 async def get_conversations(
-    user_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     limit: int = Query(10, le=100),
     offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Get list of conversations."""
+    """Get list of conversations for the authenticated user."""
     try:
+        # Always filter by authenticated user's ID
+        user_id = current_user["user_id"]
         conversations = await dao.get_conversations(
             user_id=user_id, status=status, limit=limit, offset=offset
         )
@@ -92,12 +95,20 @@ async def get_conversations(
 
 
 @router.get("/{conversation_id}", response_model=ConversationResponse)
-async def get_conversation(conversation_id: str, dao: DynamoDBDAO = Depends(get_dao)):
-    """Get a specific conversation."""
+async def get_conversation(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
+    """Get a specific conversation. Only accessible by the owner."""
     try:
         conversation = await dao.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Verify ownership
+        if str(conversation.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
 
         turn_count = await dao.get_turn_count(conversation_id)
 
@@ -122,12 +133,15 @@ async def get_conversation(conversation_id: str, dao: DynamoDBDAO = Depends(get_
 
 @router.post("/", response_model=ConversationResponse)
 async def create_conversation(
-    request: ConversationCreate, dao: DynamoDBDAO = Depends(get_dao)
+    request: ConversationCreate,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Create a new conversation."""
+    """Create a new conversation. Always associated with the authenticated user."""
     try:
+        # Use authenticated user's ID, ignore user_id in request
         conversation = Conversation(
-            user_id=UUID(request.user_id),
+            user_id=UUID(current_user["user_id"]),
             room_id=request.room_id,
             metadata=request.metadata,
         )
@@ -156,13 +170,18 @@ async def update_conversation_status(
     conversation_id: str,
     status: str,
     summary: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Update conversation status."""
+    """Update conversation status. Only accessible by the owner."""
     try:
         conversation = await dao.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Verify ownership
+        if str(conversation.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
 
         # Update status
         conversation.status = ConversationStatus(status)
@@ -191,14 +210,19 @@ async def get_conversation_turns(
     conversation_id: str,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
     dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Get turns for a conversation."""
+    """Get turns for a conversation. Only accessible by the owner."""
     try:
-        # Verify conversation exists
+        # Verify conversation exists and user owns it
         conversation = await dao.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Verify ownership
+        if str(conversation.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
 
         turns = await dao.get_conversation_turns(
             conversation_id=conversation_id, limit=limit, offset=offset
@@ -229,13 +253,19 @@ async def get_conversation_turns(
 
 @router.delete("/{conversation_id}")
 async def delete_conversation(
-    conversation_id: str, dao: DynamoDBDAO = Depends(get_dao)
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+    dao: DynamoDBDAO = Depends(get_dao),
 ):
-    """Delete a conversation."""
+    """Delete a conversation. Only accessible by the owner."""
     try:
         conversation = await dao.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Verify ownership
+        if str(conversation.user_id) != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
 
         # Delete conversation and associated turns/actions
         await dao.delete_conversation(conversation_id)
