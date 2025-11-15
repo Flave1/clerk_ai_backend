@@ -11,7 +11,6 @@ from typing import Optional, AsyncIterator, Dict, Any
 import struct
 
 import boto3
-import whisper
 from botocore.exceptions import ClientError
 
 from shared.config import get_settings
@@ -25,7 +24,6 @@ class STTService:
     """Speech-to-Text service with real-time streaming support."""
 
     def __init__(self):
-        self.whisper_model = None
         self.aws_transcribe = None
         self.deepgram_client = None
         self.openai_realtime_client = None
@@ -41,6 +39,11 @@ class STTService:
                 deepgram_api_key = os.getenv('DEEPGRAM_API_KEY')
             
             if deepgram_api_key:
+                masked_key = f"{deepgram_api_key[:4]}...{deepgram_api_key[-4:]}" if len(deepgram_api_key) > 8 else "<hidden>"
+                logger.warning("🔐 Detected Deepgram API key in configuration", extra={
+                    "key_preview": masked_key,
+                    "key_length": len(deepgram_api_key)
+                })
                 try:
                     from deepgram import DeepgramClient, DeepgramClientOptions, PrerecordedOptions, FileSource
                     self.deepgram_client = DeepgramClient(deepgram_api_key)
@@ -53,38 +56,34 @@ class STTService:
                 logger.warning("⚠️ DEEPGRAM_API_KEY not found. Deepgram STT will not be available.")
                 logger.warning("   Set DEEPGRAM_API_KEY environment variable or in settings to enable Deepgram STT.")
             
-            # Initialize ElevenLabs Speech-to-Text (REQUIRED)
+            # Initialize ElevenLabs Speech-to-Text (optional)
             elevenlabs_api_key = getattr(settings, 'elevenlabs_api_key', None)
             if not elevenlabs_api_key:
                 elevenlabs_api_key = os.getenv('ELEVENLABS_API_KEY')
             
-            if not elevenlabs_api_key:
-                logger.error("❌ ELEVENLABS_API_KEY not found. ElevenLabs STT REQUIRED but not configured.")
-                logger.error("   Please set ELEVENLABS_API_KEY environment variable or in settings.")
-                logger.error("   Example: export ELEVENLABS_API_KEY='your_api_key_here'")
-                raise RuntimeError("ELEVENLABS_API_KEY is required for ElevenLabs STT but not configured")
+            if elevenlabs_api_key:
+                try:
+                    import elevenlabs
+                    # Set API key using the same method as TTS service
+                    if hasattr(elevenlabs, 'set_api_key'):
+                        elevenlabs.set_api_key(elevenlabs_api_key)
+                        self.elevenlabs_client = elevenlabs
+                        logger.info("✅ ElevenLabs Speech-to-Text client initialized successfully")
+                    else:
+                        logger.warning("⚠️ ElevenLabs SDK missing 'set_api_key' function. ElevenLabs STT will not be available.")
+                        logger.warning("   Please reinstall: pip install --upgrade elevenlabs")
+                except ImportError as import_err:
+                    logger.warning("⚠️ ElevenLabs SDK not installed. ElevenLabs STT will not be available.")
+                    logger.warning(f"   Import error: {import_err}")
+                    logger.warning("   Install with: pip install elevenlabs")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to initialize ElevenLabs STT: {e}")
+                    logger.warning(f"   Error details: {type(e).__name__}: {str(e)}")
+            else:
+                logger.warning("⚠️ ELEVENLABS_API_KEY not found. ElevenLabs STT will not be available.")
+                logger.warning("   Set ELEVENLABS_API_KEY environment variable or in settings to enable ElevenLabs STT.")
             
-            try:
-                import elevenlabs
-                # Set API key using the same method as TTS service
-                if hasattr(elevenlabs, 'set_api_key'):
-                    elevenlabs.set_api_key(elevenlabs_api_key)
-                    self.elevenlabs_client = elevenlabs
-                    logger.info("✅ ElevenLabs Speech-to-Text client initialized successfully")
-                else:
-                    logger.error("❌ ElevenLabs SDK missing 'set_api_key' function. Please reinstall: pip install --upgrade elevenlabs")
-                    raise RuntimeError("ElevenLabs SDK initialization failed - missing set_api_key")
-            except ImportError as import_err:
-                logger.error("❌ ElevenLabs SDK not installed.")
-                logger.error(f"   Import error: {import_err}")
-                logger.error("   Install with: pip install elevenlabs")
-                raise
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize ElevenLabs STT: {e}")
-                logger.error(f"   Error details: {type(e).__name__}: {str(e)}")
-                raise  # Raise to prevent service from continuing without ElevenLabs
-            
-            # Initialize OpenAI Whisper Realtime (fallback)
+            # Initialize OpenAI Whisper API (for transcription)
             if settings.openai_api_key:
                 try:
                     from openai import OpenAI
@@ -93,14 +92,7 @@ class STTService:
                 except ImportError:
                     logger.warning("OpenAI SDK not installed. Install with: pip install openai")
                 except Exception as e:
-                    logger.warning(f"Failed to initialize OpenAI Whisper: {e}")
-                    
-                # Fallback: Initialize local Whisper model
-                try:
-                    self.whisper_model = whisper.load_model(getattr(settings, 'whisper_model', 'base'))
-                    logger.info(f"Whisper model {settings.whisper_model} loaded (fallback)")
-                except Exception as e:
-                    logger.warning(f"Failed to load Whisper model: {e}")
+                    logger.warning(f"Failed to initialize OpenAI Whisper API: {e}")
 
             # Initialize AWS Transcribe (fallback)
             if settings.aws_access_key_id:
@@ -115,7 +107,7 @@ class STTService:
                 except Exception as e:
                     logger.warning(f"Failed to initialize AWS Transcribe: {e}")
 
-            if not self.deepgram_client and not self.openai_realtime_client and not self.whisper_model and not self.aws_transcribe and not self.elevenlabs_client:
+            if not self.deepgram_client and not self.openai_realtime_client and not self.aws_transcribe and not self.elevenlabs_client:
                 logger.warning("No STT service available. Install Deepgram/ElevenLabs SDK or configure OpenAI/AWS.")
 
         except Exception as e:
@@ -128,7 +120,7 @@ class STTService:
         
         Args:
             request: STTRequest with audio data
-            model: STT provider - "deepgram" (default), "elevenlabs", "openai", "whisper", or "aws"
+            model: STT provider - "deepgram" (default), "elevenlabs", "openai", or "aws"
         
         Returns:
             STTResponse with transcribed text
@@ -143,9 +135,6 @@ class STTService:
             # Try OpenAI Whisper API
             elif model == "openai" and self.openai_realtime_client:
                 return await self._transcribe_openai(request)
-            # Try local Whisper model
-            elif model == "whisper" and self.whisper_model:
-                return await self._transcribe_whisper(request)
             # Try AWS Transcribe
             elif model == "aws" and self.aws_transcribe:
                 return await self._transcribe_aws(request)
@@ -157,8 +146,6 @@ class STTService:
                     return await self._transcribe_elevenlabs_request(request)
                 elif self.openai_realtime_client:
                     return await self._transcribe_openai(request)
-                elif self.whisper_model:
-                    return await self._transcribe_whisper(request)
                 elif self.aws_transcribe:
                     return await self._transcribe_aws(request)
                 else:
@@ -289,45 +276,6 @@ class STTService:
             
         except Exception as e:
             logger.error(f"OpenAI Whisper transcription failed: {e}")
-            raise
-
-    async def _transcribe_whisper(self, request: STTRequest) -> STTResponse:
-        """Transcribe using Whisper."""
-        try:
-            # Convert audio data to format Whisper expects
-            audio_data = self._preprocess_audio(request.audio_data)
-
-            # Transcribe
-            result = self.whisper_model.transcribe(
-                audio_data,
-                language=request.language,
-                fp16=False,  # Use fp32 for better compatibility
-            )
-
-            # Extract text and confidence
-            text = result["text"].strip()
-
-            # Whisper doesn't provide confidence scores directly
-            # We can estimate based on segment-level confidence
-            segments = result.get("segments", [])
-            if segments:
-                avg_confidence = sum(
-                    seg.get("avg_logprob", -1) for seg in segments
-                ) / len(segments)
-                # Convert log probability to confidence (rough approximation)
-                confidence = max(0, min(1, (avg_confidence + 1) / 2))
-            else:
-                confidence = 0.8  # Default confidence
-
-            return STTResponse(
-                text=text,
-                confidence=confidence,
-                language=request.language,
-                is_final=True,
-            )
-
-        except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
             raise
 
     async def _transcribe_aws(self, request: STTRequest) -> STTResponse:
@@ -505,7 +453,7 @@ class STTService:
         Args:
             audio_stream: Async iterator of PCM 16-bit audio chunks (bytes)
             language: Language code (default: "en")
-            model: STT provider - "deepgram" (default), "openai", or "whisper"
+            model: STT provider - "deepgram" (default) or "openai"
         
         Yields:
             Dict with keys: text, is_final, confidence, language
@@ -523,32 +471,6 @@ class STTService:
                     yield result
                 return
             
-            # Fallback to buffered transcription
-            elif model == "whisper" and self.whisper_model:
-                audio_buffer = b""
-                async for chunk in audio_stream:
-                    audio_buffer += chunk
-                    if len(audio_buffer) >= 32000:  # ~1 second at 16kHz mono 16-bit
-                        try:
-                            request = STTRequest(
-                                audio_data=audio_buffer,
-                                conversation_id="realtime",
-                                turn_number=0,
-                                language=language
-                            )
-                            response = await self._transcribe_whisper(request)
-                            if response.text.strip():
-                                yield {
-                                    "text": response.text,
-                                    "is_final": response.is_final,
-                                    "confidence": response.confidence,
-                                    "language": response.language
-                                }
-                            audio_buffer = b""
-                        except Exception as e:
-                            logger.error(f"Whisper streaming error: {e}")
-                return
-            
             raise RuntimeError(f"STT model '{model}' not available")
             
         except Exception as e:
@@ -560,28 +482,46 @@ class STTService:
         audio_stream: AsyncIterator[bytes], 
         language: str = "en"
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Transcribe using Deepgram Nova-2 real-time streaming."""
+        """
+        Transcribe using Deepgram with streaming-like processing (ChatGPT-like).
+        
+        Note: Full Deepgram Live API WebSocket integration requires proper event handler setup.
+        This implementation uses batch API with small chunks for streaming-like behavior.
+        """
         try:
-            from deepgram import DeepgramClient, PrerecordedOptions, FileSource
+            from deepgram import PrerecordedOptions, FileSource
             
-            # For streaming, we'll use Deepgram's streaming API
-            # Buffer audio and send in chunks for real-time processing
+            if not self.deepgram_client:
+                raise RuntimeError("Deepgram client not initialized")
+            
+            # Streaming-like processing: buffer and process in small chunks (~500ms)
             audio_buffer = b""
-            chunk_duration_ms = 500  # Process every 500ms
-            samples_per_chunk = int(16000 * chunk_duration_ms / 1000)  # 8000 samples = 500ms
+            chunk_duration_ms = 500  # Process every 500ms for low latency
+            samples_per_chunk = int(16000 * chunk_duration_ms / 1000)  # 8000 samples
             bytes_per_chunk = samples_per_chunk * 2  # 16-bit = 2 bytes per sample
+            accumulated_text = ""
+            
+            logger.info("🔄 Starting Deepgram streaming-like transcription (500ms chunks)")
             
             async for audio_chunk in audio_stream:
                 audio_buffer += audio_chunk
                 
-                # Process when we have enough audio (~500ms)
+                # Process when we have enough audio (~500ms) for streaming-like behavior
                 if len(audio_buffer) >= bytes_per_chunk:
                     try:
-                        # Use Deepgram's prerecorded API with streaming-like processing
-                        payload: FileSource = {
-                            "buffer": audio_buffer[:bytes_per_chunk],
-                        }
+                        # Convert to WAV format
+                        wav_buffer = io.BytesIO()
+                        with wave.open(wav_buffer, 'wb') as wav_file:
+                            wav_file.setnchannels(1)  # Mono
+                            wav_file.setsampwidth(2)  # 16-bit
+                            wav_file.setframerate(16000)  # 16kHz
+                            wav_file.writeframes(audio_buffer[:bytes_per_chunk])
                         
+                        wav_buffer.seek(0)
+                        wav_data = wav_buffer.read()
+                        
+                        # Transcribe chunk
+                        payload: FileSource = {"buffer": wav_data}
                         options = PrerecordedOptions(
                             model="nova-2",
                             language=language,
@@ -589,22 +529,23 @@ class STTService:
                             punctuate=True,
                         )
                         
-                        # Transcribe chunk
                         response = self.deepgram_client.listen.rest.v("1").transcribe_file(payload, options)
                         
-                        if response.results and response.results.channels:
+                        if response and response.results and response.results.channels:
                             channel = response.results.channels[0]
                             if channel.alternatives:
                                 transcript = channel.alternatives[0].transcript
-                                if transcript.strip():
+                                if transcript and transcript.strip():
+                                    accumulated_text += transcript.strip() + " "
+                                    # Yield incremental result (streaming-like)
                                     yield {
-                                        "text": transcript,
-                                        "is_final": True,
+                                        "text": transcript.strip(),
+                                        "is_final": False,  # Mark as interim for streaming effect
                                         "confidence": getattr(channel.alternatives[0], 'confidence', 0.9),
                                         "language": language
                                     }
                         
-                        # Keep remaining audio in buffer
+                        # Keep remaining audio in buffer for next chunk
                         audio_buffer = audio_buffer[bytes_per_chunk:]
                         
                     except Exception as e:
@@ -612,31 +553,51 @@ class STTService:
                         audio_buffer = b""  # Reset on error
                         continue
             
-            # Process remaining buffer
+            # Process remaining buffer as final result
             if len(audio_buffer) > 3200:  # At least 100ms of audio
                 try:
-                    payload: FileSource = {"buffer": audio_buffer}
+                    wav_buffer = io.BytesIO()
+                    with wave.open(wav_buffer, 'wb') as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(16000)
+                        wav_file.writeframes(audio_buffer)
+                    
+                    wav_buffer.seek(0)
+                    payload: FileSource = {"buffer": wav_buffer.read()}
                     options = PrerecordedOptions(
                         model="nova-2",
                         language=language,
                         smart_format=True,
                         punctuate=True,
                     )
+                    
                     response = self.deepgram_client.listen.rest.v("1").transcribe_file(payload, options)
                     
-                    if response.results and response.results.channels:
+                    if response and response.results and response.results.channels:
                         channel = response.results.channels[0]
                         if channel.alternatives:
                             transcript = channel.alternatives[0].transcript
-                            if transcript.strip():
+                            if transcript and transcript.strip():
+                                accumulated_text += transcript.strip()
+                                # Yield final result
                                 yield {
-                                    "text": transcript,
+                                    "text": transcript.strip(),
                                     "is_final": True,
                                     "confidence": getattr(channel.alternatives[0], 'confidence', 0.9),
                                     "language": language
                                 }
                 except Exception as e:
                     logger.error(f"Deepgram final chunk transcription error: {e}")
+            
+            # Yield accumulated final text if we have it
+            if accumulated_text.strip():
+                yield {
+                    "text": accumulated_text.strip(),
+                    "is_final": True,
+                    "confidence": 0.95,
+                    "language": language
+                }
                     
         except ImportError:
             logger.error("Deepgram SDK not installed. Install with: pip install deepgram-sdk")
@@ -881,8 +842,21 @@ class STTService:
                 
                 # Log when speech is detected (but throttle to once per second)
                 if (time.time() - self._last_log_time) > 1.0:
-                    logger.info(f"✅ Speech activity detected: RMS={rms_energy:.4f}, non_zero={non_zero_ratio:.2%}, ZCR={zcr:.4f}, spectral={spectral_centroid:.1f}Hz, audio_len={len(audio_chunk)} bytes")
-                    logger.info(f"   VAD result: energy_based={energy_based}, zcr_based={zcr_based}, spectral_based={spectral_based}, has_speech={has_speech}")
+                    logger.debug(
+                        "✅ Speech activity detected: RMS=%s, non_zero=%.2f%%, ZCR=%s, spectral=%.1fHz, audio_len=%s bytes",
+                        f"{rms_energy:.4f}",
+                        non_zero_ratio * 100,
+                        f"{zcr:.4f}",
+                        spectral_centroid,
+                        len(audio_chunk),
+                    )
+                    logger.debug(
+                        "   VAD result: energy_based=%s, zcr_based=%s, spectral_based=%s, has_speech=%s",
+                        energy_based,
+                        zcr_based,
+                        spectral_based,
+                        has_speech,
+                    )
                     self._last_log_time = time.time()
             else:
                 # Log when speech is NOT detected (throttled to avoid spam)

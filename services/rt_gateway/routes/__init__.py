@@ -1,0 +1,2 @@
+"""RT Gateway routes package."""
+

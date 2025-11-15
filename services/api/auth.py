@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import bcrypt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 
@@ -15,8 +15,8 @@ from shared.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# HTTP Bearer token scheme
-security = HTTPBearer()
+# HTTP Bearer token scheme - set auto_error=False to handle missing tokens gracefully
+security = HTTPBearer(auto_error=False)
 
 
 def hash_password(password: str) -> str:
@@ -125,13 +125,15 @@ def decode_access_token(token: str) -> Optional[dict]:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ) -> dict:
     """
     Dependency to get the current authenticated user from JWT token.
     
     Args:
-        credentials: HTTP Bearer token credentials
+        credentials: HTTP Bearer token credentials (may be None if header is missing)
+        request: FastAPI request object for debugging
         
     Returns:
         User payload from token (contains user_id and email)
@@ -139,6 +141,24 @@ async def get_current_user(
     Raises:
         HTTPException: If token is invalid or missing
     """
+    # Debug logging to see what's happening
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    logger.warning(f"[Auth Debug] Authorization header in request: {auth_header is not None}")
+    if auth_header:
+        logger.warning(f"[Auth Debug] Authorization header value (first 30 chars): {auth_header[:30]}...")
+    else:
+        logger.warning(f"[Auth Debug] Authorization header NOT found in request")
+        logger.warning(f"[Auth Debug] Available headers: {list(request.headers.keys())}")
+    
+    if credentials is None:
+        logger.warning(f"[Auth Debug] HTTPBearer returned None - credentials not found by HTTPBearer")
+        logger.warning(f"[Auth Debug] This means HTTPBearer couldn't extract the token from the Authorization header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please provide a valid Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     token = credentials.credentials
     payload = decode_access_token(token)
     

@@ -4,12 +4,15 @@ Turn management and dialogue orchestration.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from uuid import UUID
 
 from shared.config import get_settings
 from shared.schemas import (Action, ActionStatus, ActionType, Conversation,
                             ConversationStatus, Turn, TurnType)
+
+if TYPE_CHECKING:
+    from services.api.dao import DynamoDBDAO
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -18,15 +21,26 @@ settings = get_settings()
 class TurnManager:
     """Manages conversation turns and dialogue flow."""
 
-    def __init__(self, llm_service, event_publisher, tts_service=None, livekit_bridge=None):
+    def __init__(self, llm_service, event_publisher, tts_service=None, dao: Optional[Any] = None):
         self.llm_service = llm_service
         self.event_publisher = event_publisher
         self.tts_service = tts_service
-        self.livekit_bridge = livekit_bridge
+        # Use injected DAO or get from global instance
+        if dao is not None:
+            self._dao = dao
+        else:
+            # Try to get from global instance (initialized in unified_app)
+            try:
+                from services.api.dao import get_dao
+                self._dao = get_dao()
+            except RuntimeError:
+                # DAO not initialized yet, will be set later
+                self._dao = None
         self.conversations: Dict[str, Conversation] = {}
         self.conversation_turns: Dict[str, List[Turn]] = {}
         self.conversation_state: Dict[str, str] = {}  # conversation_id -> state
         self.conversation_websockets: Dict[str, any] = {}  # conversation_id -> websocket
+        self.conversation_participants: Dict[str, List[str]] = {}
 
     def register_websocket(self, conversation_id: str, websocket):
         """Register a WebSocket connection for a conversation."""
@@ -39,7 +53,12 @@ class TurnManager:
             del self.conversation_websockets[conversation_id]
             logger.info(f"Unregistered WebSocket for conversation {conversation_id}")
 
-    async def start_conversation(self, room_id: str, user_id: str) -> Conversation:
+    async def start_conversation(
+        self,
+        room_id: str,
+        user_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Conversation:
         """Start a new conversation."""
         try:
             # Convert user_id to UUID if it's not already a valid UUID
@@ -50,17 +69,19 @@ class TurnManager:
                 from uuid import uuid4
                 user_uuid = uuid4()
                 logger.info(f"Generated new UUID for user_id: {user_uuid}")
-            
             conversation = Conversation(
-                user_id=user_uuid, room_id=room_id, status=ConversationStatus.ACTIVE
+                user_id=user_uuid,
+                room_id=room_id,
+                status=ConversationStatus.ACTIVE,
             )
+
+            if metadata:
+                conversation.metadata.update(metadata)
 
             self.conversations[str(conversation.id)] = conversation
             self.conversation_turns[str(conversation.id)] = []
             self.conversation_state[str(conversation.id)] = "greeting"
-            
-            # Save conversation to database via API service
-            await self._save_conversation_to_db(conversation)
+            self.conversation_participants[str(conversation.id)] = [user_id]
 
             # Publish event
             await self.event_publisher.publish_event(
@@ -111,14 +132,12 @@ class TurnManager:
                     del self.conversation_state[conversation_id]
                 if conversation_id in self.conversation_websockets:
                     del self.conversation_websockets[conversation_id]
+                if conversation_id in self.conversation_participants:
+                    del self.conversation_participants[conversation_id]
 
-                # Cleanup audio buffers in LiveKit bridge
-                if hasattr(self, 'livekit_bridge') and self.livekit_bridge:
-                    await self.livekit_bridge.cleanup_conversation(conversation_id)
+                # Audio buffers are managed internally, no external cleanup needed
 
                 # Update conversation in database
-                await self._update_conversation_in_db(conversation)
-                
                 logger.info(f"Ended conversation {conversation_id}")
             else:
                 logger.warning(f"Conversation {conversation_id} not found in turn_manager, but proceeding with cleanup")
@@ -141,9 +160,10 @@ class TurnManager:
                 logger.warning(f"Conversation {conversation_id} not found")
                 return False
 
+            participants = self.conversation_participants.setdefault(conversation_id, [])
             # Add user to conversation participants
-            if user_id not in conversation.participants:
-                conversation.participants.append(user_id)
+            if user_id not in participants:
+                participants.append(user_id)
                 logger.info(f"Added participant {user_id} to conversation {conversation_id}")
                 return True
             else:
@@ -212,8 +232,14 @@ class TurnManager:
             # Get conversation context
             context = await self._build_context(conversation_id)
 
+            meeting_id = conversation.metadata.get("meeting_id") if conversation.metadata else None
+
             # Process through LLM
-            response = await self.llm_service.process_turn(turn, context)
+            response = await self.llm_service.process_turn(
+                turn,
+                context,
+                meeting_id=meeting_id,
+            )
 
             if response:
                 # Create AI response turn
@@ -259,8 +285,14 @@ class TurnManager:
             # Get conversation context
             context = await self._build_context(conversation_id)
 
+            meeting_id = conversation.metadata.get("meeting_id") if conversation.metadata else None
+
             # Process through LLM
-            response = await self.llm_service.process_turn(turn, context)
+            response = await self.llm_service.process_turn(
+                turn,
+                context,
+                meeting_id=meeting_id,
+            )
 
             if response:
                 # Create AI response turn
@@ -417,18 +449,12 @@ class TurnManager:
                 websocket = self.conversation_websockets.get(conversation_id)
                 
                 if websocket:
+                    # Send TTS audio directly to WebSocket
                     try:
-                        await self.livekit_bridge.send_tts_audio_to_websocket(websocket, tts_response.audio_data)
+                        await websocket.send_bytes(tts_response.audio_data)
                         logger.info(f"Sent TTS audio to WebSocket for conversation {conversation_id}")
                     except Exception as ws_error:
                         logger.error(f"Failed to send TTS to WebSocket: {ws_error}")
-                
-                # Also send to LiveKit room if available
-                if hasattr(self, 'livekit_bridge') and self.livekit_bridge:
-                    room_id = conversation.room_id or "default"
-                    await self.livekit_bridge.send_tts_audio(room_id, tts_response.audio_data)
-                else:
-                    logger.warning("LiveKit bridge not available for TTS audio streaming")
             else:
                 logger.warning("No TTS audio generated")
             
@@ -438,12 +464,12 @@ class TurnManager:
     async def load_existing_conversation(self, conversation_id: str) -> Optional[Conversation]:
         """Load an existing conversation from the database."""
         try:
-            # Import DAO directly to avoid circular imports
-            from services.api.dao import DynamoDBDAO
+            # Use the DAO instance from TurnManager (already initialized)
+            if self._dao is None:
+                from services.api.dao import get_dao
+                self._dao = get_dao()
             
-            # Create a DAO instance and load conversation
-            dao = DynamoDBDAO()
-            await dao.initialize()
+            dao = self._dao
             conversation = await dao.get_conversation(conversation_id)
             
             if conversation:
@@ -468,31 +494,9 @@ class TurnManager:
             return None
 
     async def _save_conversation_to_db(self, conversation: Conversation):
-        """Save conversation to database directly."""
-        try:
-            # Import DAO directly to avoid creating duplicate conversations
-            from services.api.dao import DynamoDBDAO
-            
-            # Create a DAO instance and save directly
-            dao = DynamoDBDAO()
-            await dao.initialize()
-            await dao.create_conversation(conversation)
-            logger.info(f"Saved conversation {conversation.id} to database")
-                    
-        except Exception as e:
-            logger.error(f"Failed to save conversation to database: {e}")
+        """Deprecated: Conversations are managed in-memory."""
+        logger.debug("Conversation persistence disabled; skipping save.")
 
     async def _update_conversation_in_db(self, conversation: Conversation):
-        """Update conversation in database."""
-        try:
-            # Import DAO directly to avoid circular imports
-            from services.api.dao import DynamoDBDAO
-            
-            # Create a DAO instance and update directly
-            dao = DynamoDBDAO()
-            await dao.initialize()
-            await dao.update_conversation(conversation)
-            logger.info(f"Updated conversation {conversation.id} in database")
-                    
-        except Exception as e:
-            logger.error(f"Failed to update conversation in database: {e}")
+        """Deprecated: Conversations are managed in-memory."""
+        logger.debug("Conversation persistence disabled; skipping update.")

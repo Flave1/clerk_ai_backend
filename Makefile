@@ -1,4 +1,4 @@
-# AI Receptionist Backend Makefile
+# Backend Makefile
 
 .PHONY: help install dev test test-unit test-integration test-e2e lint format clean build run-api run-workers run-rt-gateway setup-test-db run-meeting-agent test-meeting-agent
 
@@ -166,7 +166,7 @@ env-check:
 # Health checks
 health-check:
 	@echo "Running health checks..."
-	curl -f http://localhost:8000/health || exit 1
+	curl -f https://api.auray.net/health || exit 1
 
 # Documentation
 docs:

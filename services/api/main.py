@@ -1,5 +1,5 @@
 """
-Main API service for the AI Receptionist system.
+Main API service for the Aurray system.
 Provides REST endpoints and WebSocket connections for the dashboard.
 """
 import logging
@@ -13,9 +13,7 @@ from fastapi.responses import JSONResponse
 from shared.config import get_settings
 
 from .dao import DynamoDBDAO, set_dao_instance
-# from .routes import actions, conversations, rooms, meetings
-# from .ws import ConnectionManager
-from services.api.routes import actions, auth, rooms, meetings, api_keys, webhooks
+from services.api.routes import actions, auth, rooms, meetings, api_keys, webhooks, integrations, meeting_contexts, newsletter
 from services.api.ws import ConnectionManager
 
 # Configure logging
@@ -53,8 +51,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AI Receptionist API",
-    description="REST API and WebSocket service for the AI Receptionist dashboard",
+    title="Aurray API",
+    description="REST API and WebSocket service for the Aurray dashboard",
     version=settings.app_version,
     lifespan=lifespan,
 )
@@ -91,8 +89,26 @@ app.include_router(
 
 app.include_router(
     webhooks.router,
-    prefix="/v1/api.auray.net",
-    tags=["webhooks"],
+    prefix="/v1/api.aurray.net",
+    tags=["webhooks"],  
+)
+
+app.include_router(
+    integrations.router,
+    prefix=f"{settings.api_prefix}/integrations",
+    tags=["integrations"],
+)
+
+app.include_router(
+    meeting_contexts.router,
+    prefix=f"{settings.api_prefix}/meeting-contexts",
+    tags=["meeting-contexts"],
+)
+
+app.include_router(
+    newsletter.router,
+    prefix=f"{settings.api_prefix}/newsletter",
+    tags=["newsletter"],
 )
 
 

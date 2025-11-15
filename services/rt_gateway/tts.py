@@ -8,11 +8,38 @@ from typing import Optional, Iterator
 import struct
 import base64
 
-import boto3
-import elevenlabs
-from botocore.exceptions import ClientError
-import pydub
-from pydub.utils import make_chunks
+# Optional imports - service will work without these
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    boto3 = None
+    ClientError = Exception
+    BOTO3_AVAILABLE = False
+    logger_import = logging.getLogger(__name__)
+    logger_import.warning("⚠️ boto3 not installed. AWS Polly will not be available. Install with: pip install boto3")
+
+# Optional imports - service will work without these
+try:
+    import elevenlabs
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    elevenlabs = None
+    ELEVENLABS_AVAILABLE = False
+    logger_import = logging.getLogger(__name__)
+    logger_import.warning("⚠️ ElevenLabs SDK not installed. Install with: pip install elevenlabs")
+
+try:
+    import pydub
+    from pydub.utils import make_chunks
+    PYDUB_AVAILABLE = True
+except ImportError:
+    pydub = None
+    make_chunks = None
+    PYDUB_AVAILABLE = False
+    logger_import = logging.getLogger(__name__)
+    logger_import.warning("⚠️ pydub not installed. Install with: pip install pydub")
 
 from shared.config import get_settings
 from shared.schemas import TTSRequest, TTSResponse
@@ -32,25 +59,57 @@ class TTSService:
     def _initialize_services(self):
         """Initialize TTS services."""
         try:
-            # Initialize ElevenLabs
+            # Initialize ElevenLabs (only if package is installed)
             if settings.elevenlabs_api_key:
-                elevenlabs.set_api_key(settings.elevenlabs_api_key)
-                self.elevenlabs_client = elevenlabs
-                logger.info("ElevenLabs client initialized")
+                if not ELEVENLABS_AVAILABLE:
+                    logger.warning("⚠️ ElevenLabs API key configured but SDK not installed. Install with: pip install elevenlabs")
+                else:
+                    try:
+                        elevenlabs.set_api_key(settings.elevenlabs_api_key)
+                        self.elevenlabs_client = elevenlabs
+                        logger.info("✅ ElevenLabs client initialized")
+                    except Exception as e:
+                        logger.warning(f"Failed to initialize ElevenLabs: {e}")
 
-            # Initialize AWS Polly
+            # Initialize AWS Polly (only if boto3 is installed)
             if settings.aws_access_key_id:
-                self.aws_polly = boto3.client(
-                    "polly",
-                    region_name=settings.aws_region,
-                    aws_access_key_id=settings.aws_access_key_id,
-                    aws_secret_access_key=settings.aws_secret_access_key,
-                )
-                logger.info("AWS Polly client initialized")
+                if not BOTO3_AVAILABLE:
+                    logger.warning("⚠️ AWS credentials configured but boto3 not installed. Install with: pip install boto3")
+                else:
+                    try:
+                        self.aws_polly = boto3.client(
+                            "polly",
+                            region_name=settings.aws_region,
+                            aws_access_key_id=settings.aws_access_key_id,
+                            aws_secret_access_key=settings.aws_secret_access_key,
+                        )
+                        logger.info("✅ AWS Polly client initialized")
+                    except Exception as e:
+                        logger.warning(f"Failed to initialize AWS Polly: {e}")
+
+            # Check if at least one provider is available (including OpenAI)
+            has_provider = (
+                self.elevenlabs_client is not None or
+                self.aws_polly is not None or
+                settings.openai_api_key is not None
+            )
+            
+            if not has_provider:
+                logger.warning("⚠️ No TTS provider configured. Set ELEVENLABS_API_KEY, AWS credentials, or OPENAI_API_KEY to enable TTS.")
+            else:
+                providers = []
+                if self.elevenlabs_client:
+                    providers.append("ElevenLabs")
+                if self.aws_polly:
+                    providers.append("AWS Polly")
+                if settings.openai_api_key:
+                    providers.append("OpenAI")
+                logger.info(f"✅ TTS service initialized with providers: {', '.join(providers)}")
 
         except Exception as e:
             logger.error(f"Failed to initialize TTS services: {e}")
-            raise
+            # Don't raise - allow service to continue with limited functionality
+            # Individual methods will check for available providers
 
     async def synthesize(self, request: TTSRequest) -> TTSResponse:
         """Synthesize text to speech."""
@@ -76,6 +135,9 @@ class TTSService:
 
     async def _synthesize_elevenlabs(self, request: TTSRequest) -> TTSResponse:
         """Synthesize using ElevenLabs."""
+        if not ELEVENLABS_AVAILABLE or not self.elevenlabs_client:
+            raise RuntimeError("ElevenLabs SDK not available")
+        
         try:
             # Get voice ID (use default if not specified)
             voice_id = (
@@ -186,20 +248,23 @@ class TTSService:
         try:
             voices = []
 
-            if self.elevenlabs_client:
+            if self.elevenlabs_client and ELEVENLABS_AVAILABLE:
                 # Get ElevenLabs voices
-                elevenlabs_voices = elevenlabs.voices()
-                voices.extend(
-                    [
-                        {
-                            "id": voice.voice_id,
-                            "name": voice.name,
-                            "provider": "elevenlabs",
-                            "category": voice.category,
-                        }
-                        for voice in elevenlabs_voices
-                    ]
-                )
+                try:
+                    elevenlabs_voices = elevenlabs.voices()
+                    voices.extend(
+                        [
+                            {
+                                "id": voice.voice_id,
+                                "name": voice.name,
+                                "provider": "elevenlabs",
+                                "category": voice.category,
+                            }
+                            for voice in elevenlabs_voices
+                        ]
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get ElevenLabs voices: {e}")
 
             if self.aws_polly:
                 # Get AWS Polly voices
@@ -223,7 +288,7 @@ class TTSService:
             logger.error(f"Failed to get available voices: {e}")
             return []
 
-    async def synthesize_to_pcm(self, text: str, voice_id: str = "default", model: str = "openai") -> Iterator[bytes]:
+    async def synthesize_to_pcm(self, text: str, voice_id: str = "default", model: str = "openai", cancelled: Optional[asyncio.Event] = None) -> Iterator[bytes]:
         """
         Synthesize text to PCM audio samples and yield in chunks in REAL-TIME.
         Returns PCM float32 samples at 16kHz.
@@ -232,13 +297,14 @@ class TTSService:
             text: Text to synthesize
             voice_id: Voice ID to use
             model: TTS provider to use - '11lab' (default, real-time streaming) or 'openai' (buffered)
+            cancelled: Optional asyncio.Event to signal cancellation
         
         Default: ElevenLabs streaming for minimal latency.
         Fallback: OpenAI TTS (buffered, not real-time) if ElevenLabs unavailable.
         """
         try:
             # ElevenLabs REAL-TIME STREAMING (default - preferred for low latency)
-            if model == "11lab" and self.elevenlabs_client:
+            if model == "11lab" and self.elevenlabs_client and ELEVENLABS_AVAILABLE and PYDUB_AVAILABLE:
                 actual_voice_id = voice_id if voice_id != "default" else "21m00Tcm4TlvDq8ikWAM"
                 
                 # Stream MP3 chunks from ElevenLabs (low latency)
@@ -257,6 +323,11 @@ class TTSService:
                 total_pcm_samples = 0
                 
                 for mp3_chunk in audio_generator:
+                    # Check for cancellation
+                    if cancelled and cancelled.is_set():
+                        logger.info("TTS generation cancelled, stopping stream")
+                        break
+                    
                     if not isinstance(mp3_chunk, bytes):
                         continue
                         
@@ -311,6 +382,7 @@ class TTSService:
                                 break
                 
                 # Process any remaining buffered MP3 data
+                # Even if cancelled, try to process final buffer to avoid cutting off responses
                 if len(mp3_buffer) > 0:
                     try:
                         audio_segment = pydub.AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
@@ -325,6 +397,10 @@ class TTSService:
                             chunk_size = 10000
                             for i in range(0, len(float_samples), chunk_size):
                                 chunk = float_samples[i:i + chunk_size]
+                                # Check cancellation before yielding each chunk
+                                if cancelled and cancelled.is_set():
+                                    logger.info(f"Final buffer processing cancelled, stopping at chunk {i//chunk_size + 1}")
+                                    break
                                 pcm_chunk = struct.pack(f'<{len(chunk)}f', *chunk)
                                 total_pcm_samples += len(chunk)
                                 yield pcm_chunk
@@ -332,7 +408,10 @@ class TTSService:
                             logger.debug(f"Skipping tiny final MP3 chunk ({len(float_samples)} samples) to prevent noise")
                             total_pcm_samples += len(float_samples)  # Still count for logging
                     except Exception as e:
-                        logger.warning(f"Failed to decode final MP3 chunk ({len(mp3_buffer)} bytes): {e}")
+                        if cancelled and cancelled.is_set():
+                            logger.debug(f"Final MP3 buffer processing cancelled ({len(mp3_buffer)} bytes)")
+                        else:
+                            logger.warning(f"Failed to decode final MP3 chunk ({len(mp3_buffer)} bytes): {e}")
                 
                 logger.info(f"ElevenLabs streamed {total_mp3_bytes} bytes MP3, synthesized {total_pcm_samples} PCM samples in real-time")
                 return
@@ -344,6 +423,9 @@ class TTSService:
             # OpenAI TTS (option or fallback - buffered, not real-time)
             # Note: OpenAI TTS waits for complete response before sending (higher latency)
             if (model == "openai" or model == "11lab") and settings.openai_api_key:
+                if not PYDUB_AVAILABLE:
+                    raise RuntimeError("pydub is required for OpenAI TTS. Install with: pip install pydub")
+                
                 import openai
                 openai.api_key = settings.openai_api_key
                 

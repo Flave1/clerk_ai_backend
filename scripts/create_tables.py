@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to create DynamoDB tables for the AI Receptionist system.
+Script to create DynamoDB tables for the Aurray system.
 """
 import asyncio
 import logging
@@ -24,8 +24,27 @@ settings = get_settings()
 def create_dynamodb_tables():
     """Create all required DynamoDB tables."""
     try:
+        # Determine if we should use local DynamoDB (same logic as DAO)
+        use_local = settings.use_local_dynamodb
+        
+        # Auto-detect: if USE_LOCAL_DYNAMODB is not explicitly set and AWS credentials are missing,
+        # try local DynamoDB first
+        if not use_local and not settings.aws_access_key_id:
+            logger.info("No AWS credentials found. Using local DynamoDB...")
+            use_local = True
+        
         # Initialize DynamoDB client
-        if settings.aws_access_key_id:
+        if use_local:
+            logger.info(f"Connecting to local DynamoDB at {settings.dynamodb_local_endpoint}")
+            dynamodb = boto3.resource(
+                "dynamodb",
+                region_name=settings.aws_region,
+                endpoint_url=settings.dynamodb_local_endpoint,
+                aws_access_key_id="dummy",  # Required for local DynamoDB
+                aws_secret_access_key="dummy",  # Required for local DynamoDB
+            )
+        elif settings.aws_access_key_id:
+            logger.info(f"Connecting to AWS DynamoDB (Region: {settings.aws_region})")
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=settings.aws_region,
@@ -33,11 +52,11 @@ def create_dynamodb_tables():
                 aws_secret_access_key=settings.aws_secret_access_key,
             )
         else:
-            # Use local DynamoDB for development
+            # Try using IAM role (for ECS/Lambda)
+            logger.info(f"Connecting to AWS DynamoDB using IAM role (Region: {settings.aws_region})")
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=settings.aws_region,
-                endpoint_url="http://localhost:8001",
             )
 
         # Table configurations
@@ -294,6 +313,69 @@ def create_dynamodb_tables():
                 "WriteCapacityUnits": 5,
             },
         },
+        {
+            "TableName": f"{settings.dynamodb_table_prefix}{settings.user_integrations_table}",
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "user-id-index",
+                    "KeySchema": [
+                        {"AttributeName": "user_id", "KeyType": "HASH"},
+                        {"AttributeName": "id", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                },
+            ],
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        },
+        {
+            "TableName": f"{settings.dynamodb_table_prefix}{settings.meeting_contexts_table}",
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "user-id-index",
+                    "KeySchema": [
+                        {"AttributeName": "user_id", "KeyType": "HASH"},
+                        {"AttributeName": "id", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                },
+            ],
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        },
+        {
+            "TableName": f"{settings.dynamodb_table_prefix}{settings.newsletter_table}",
+            "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "email", "AttributeType": "S"},
+            ],
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        },
 ]
 
 
@@ -343,8 +425,27 @@ def create_dynamodb_tables():
 def delete_dynamodb_tables():
     """Delete all DynamoDB tables (for development/testing)."""
     try:
+        # Determine if we should use local DynamoDB (same logic as DAO)
+        use_local = settings.use_local_dynamodb
+        
+        # Auto-detect: if USE_LOCAL_DYNAMODB is not explicitly set and AWS credentials are missing,
+        # try local DynamoDB first
+        if not use_local and not settings.aws_access_key_id:
+            logger.info("No AWS credentials found. Using local DynamoDB...")
+            use_local = True
+        
         # Initialize DynamoDB client
-        if settings.aws_access_key_id:
+        if use_local:
+            logger.info(f"Connecting to local DynamoDB at {settings.dynamodb_local_endpoint}")
+            dynamodb = boto3.resource(
+                "dynamodb",
+                region_name=settings.aws_region,
+                endpoint_url=settings.dynamodb_local_endpoint,
+                aws_access_key_id="dummy",  # Required for local DynamoDB
+                aws_secret_access_key="dummy",  # Required for local DynamoDB
+            )
+        elif settings.aws_access_key_id:
+            logger.info(f"Connecting to AWS DynamoDB (Region: {settings.aws_region})")
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=settings.aws_region,
@@ -352,11 +453,11 @@ def delete_dynamodb_tables():
                 aws_secret_access_key=settings.aws_secret_access_key,
             )
         else:
-            # Use local DynamoDB for development
+            # Try using IAM role (for ECS/Lambda)
+            logger.info(f"Connecting to AWS DynamoDB using IAM role (Region: {settings.aws_region})")
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=settings.aws_region,
-                endpoint_url="http://localhost:8001",
             )
 
         # List of tables to delete
@@ -369,6 +470,9 @@ def delete_dynamodb_tables():
             f"{settings.dynamodb_table_prefix}{settings.meeting_transcriptions_table}",
             f"{settings.dynamodb_table_prefix}{settings.meeting_notifications_table}",
             f"{settings.dynamodb_table_prefix}{settings.api_keys_table}",
+            f"{settings.dynamodb_table_prefix}{settings.user_integrations_table}",
+            f"{settings.dynamodb_table_prefix}{settings.meeting_contexts_table}",
+            f"{settings.dynamodb_table_prefix}{settings.newsletter_table}",
         ]
 
         for table_name in table_names:

@@ -1,0 +1,267 @@
+"""
+Meeting context helper utilities with in-process caching.
+"""
+
+import asyncio
+import json
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
+
+from boto3.dynamodb.conditions import Key  # type: ignore
+
+from shared.schemas import Meeting, MeetingContext, MeetingRole, TonePersonality
+
+from .service_tool import ServiceTool
+
+_CACHE_LOCK = asyncio.Lock()
+_CACHE_STORE: Dict[str, Tuple[float, str]] = {}
+
+
+class ServiceMeetingContext:
+    """Provides meeting context utilities, including caching payload preparation."""
+
+    CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+
+    def __init__(self, dao):
+        self.dao = dao
+        self.tool_service = ServiceTool()
+
+    async def create_context(self, meeting_context: MeetingContext) -> MeetingContext:
+        """Persist a new meeting context."""
+        table = self._get_table()
+
+        item = {
+            "id": str(meeting_context.id),
+            "user_id": str(meeting_context.user_id),
+            "name": meeting_context.name,
+            "voice_id": meeting_context.voice_id,
+            "context_description": meeting_context.context_description,
+            "tools_integrations": meeting_context.tools_integrations,
+            "meeting_role": meeting_context.meeting_role.value,
+            "tone_personality": meeting_context.tone_personality.value,
+            "custom_tone": meeting_context.custom_tone,
+            "is_default": meeting_context.is_default,
+            "created_at": meeting_context.created_at.isoformat(),
+            "updated_at": meeting_context.updated_at.isoformat(),
+        }
+
+        table.put_item(Item=item)
+        return meeting_context
+
+    async def get_context(self, context_id: str, user_id: str) -> Optional[MeetingContext]:
+        """Fetch a meeting context by ID for a specific user."""
+        table = self._get_table()
+        response = table.get_item(Key={"id": context_id})
+        item = response.get("Item")
+        if not item or item.get("user_id") != user_id:
+            return None
+        return self._item_to_meeting_context(item)
+
+    async def get_context_by_id(self, context_id: str) -> Optional[MeetingContext]:
+        """Fetch a meeting context without enforcing user ownership."""
+        table = self._get_table()
+        response = table.get_item(Key={"id": context_id})
+        item = response.get("Item")
+        if not item:
+            return None
+        return self._item_to_meeting_context(item)
+
+    async def get_contexts_by_user(self, user_id: str) -> List[MeetingContext]:
+        """List all meeting contexts for a user."""
+        user_id_str = str(user_id)
+        table = self._get_table()
+        response = table.query(
+            IndexName="user-id-index",
+            KeyConditionExpression=Key("user_id").eq(user_id_str),
+            ScanIndexForward=False,
+        )
+
+        contexts = [self._item_to_meeting_context(item) for item in response.get("Items", [])]
+
+        contexts.sort(
+            key=lambda ctx: (
+                0 if ctx.is_default else 1,
+                -((ctx.updated_at or ctx.created_at).timestamp()),
+            )
+        )
+        return contexts
+
+    async def update_context(self, meeting_context: MeetingContext) -> MeetingContext:
+        """Update and persist a meeting context."""
+        table = self._get_table()
+        meeting_context.updated_at = datetime.now(timezone.utc)
+
+        item = {
+            "id": str(meeting_context.id),
+            "user_id": str(meeting_context.user_id),
+            "name": meeting_context.name,
+            "voice_id": meeting_context.voice_id,
+            "context_description": meeting_context.context_description,
+            "tools_integrations": meeting_context.tools_integrations,
+            "meeting_role": meeting_context.meeting_role.value,
+            "tone_personality": meeting_context.tone_personality.value,
+            "custom_tone": meeting_context.custom_tone,
+            "is_default": meeting_context.is_default,
+            "created_at": meeting_context.created_at.isoformat(),
+            "updated_at": meeting_context.updated_at.isoformat(),
+        }
+
+        table.put_item(Item=item)
+        return meeting_context
+
+    async def clear_default_contexts(self, user_id: str, exclude_context_id: Optional[str] = None) -> None:
+        """Ensure only one default meeting context per user by clearing others."""
+        table = self._get_table()
+        contexts = await self.get_contexts_by_user(user_id)
+        for context in contexts:
+            context_id_str = str(context.id)
+            if context.is_default and (exclude_context_id is None or context_id_str != exclude_context_id):
+                table.update_item(
+                    Key={"id": context_id_str},
+                    UpdateExpression="SET is_default = :false, updated_at = :updated",
+                    ExpressionAttributeValues={
+                        ":false": False,
+                        ":updated": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+    async def delete_context(self, context_id: str, user_id: str) -> bool:
+        """Delete a meeting context if it belongs to the user."""
+        table = self._get_table()
+        context = await self.get_context(context_id, user_id)
+        if not context:
+            return False
+        table.delete_item(Key={"id": context_id})
+        return True
+
+    async def fetch_context_payload(self, context_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the meeting context and build a payload suitable for caching."""
+        context: Optional[MeetingContext] = await self.get_context(context_id, user_id)
+        if not context:
+            return None
+
+        tools = self.tool_service.resolve_tools(context.tools_integrations or [])
+
+        payload: Dict[str, Any] = {
+            "id": str(context.id),
+            "user_id": str(context.user_id),
+            "name": context.name,
+            "voice_id": context.voice_id,
+            "context_description": context.context_description,
+            "tools": tools,
+            "meeting_role": context.meeting_role.value,
+            "tone_personality": context.tone_personality.value,
+            "custom_tone": context.custom_tone,
+            "is_default": context.is_default,
+        }
+        payload["system_prompt"] = self.build_system_prompt(payload)
+        return payload
+
+    def build_system_prompt(self, payload: Dict[str, Any]) -> str:
+        """Construct a system prompt incorporating meeting context details."""
+        lines = [
+            payload.get("context_description", "").strip(),
+            "",
+            f"Meeting role: {payload.get('meeting_role', '').capitalize()}",
+        ]
+
+        tone = payload.get("tone_personality")
+        custom_tone = payload.get("custom_tone")
+        if tone:
+            lines.append(f"Tone personality: {tone.capitalize()}")
+        if custom_tone:
+            lines.append(f"Custom tone guidance: {custom_tone}")
+
+        tools = payload.get("tools") or []
+        if tools:
+            lines.append("")
+            lines.append("Available tools:")
+            for tool in tools:
+                lines.append(f"- {tool.get('name')}: {tool.get('description')} (function: {tool.get('function')})")
+
+        return "\n".join(filter(None, lines)).strip()
+
+    async def cache_payload(self, meeting_id: str, payload: Dict[str, Any]) -> None:
+        """Store the context payload in the in-process cache."""
+        expires_at = time.monotonic() + self.CACHE_TTL_SECONDS
+        serialized = json.dumps(payload)
+        key = self._cache_key(meeting_id)
+        async with _CACHE_LOCK:
+            _CACHE_STORE[key] = (expires_at, serialized)
+
+    async def get_cached_payload(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve cached context payload from the in-process cache."""
+        key = self._cache_key(meeting_id)
+        async with _CACHE_LOCK:
+            entry = _CACHE_STORE.get(key)
+            if not entry:
+                return None
+            expires_at, serialized = entry
+            if expires_at <= time.monotonic():
+                del _CACHE_STORE[key]
+            return None
+        return json.loads(serialized)
+
+    async def clear_cached_payload(self, meeting_id: str) -> None:
+        """Remove a cached context payload if it exists."""
+        key = self._cache_key(meeting_id)
+        async with _CACHE_LOCK:
+            _CACHE_STORE.pop(key, None)
+
+    @staticmethod
+    def _cache_key(meeting_id: str) -> str:
+        return f"meeting:context:{meeting_id}"
+
+    async def fetch_default_context(self, user_id: str) -> Optional[MeetingContext]:
+        """Return the default meeting context for a user if one is configured."""
+        user_id_str = str(user_id)
+        contexts = await self.get_contexts_by_user(user_id_str)
+
+        for context in contexts:
+            if context.is_default:
+                return context
+        return None
+
+    async def apply_default_context_to_meeting(self, meeting: Meeting) -> Meeting:
+        """Ensure the meeting has a context by applying the user's default if necessary."""
+        if meeting.context_id:
+            return meeting
+
+        if not getattr(meeting, "user_id", None):
+            return meeting
+
+        default_context = await self.fetch_default_context(str(meeting.user_id))
+        if default_context:
+            meeting.context_id = str(default_context.id)
+            if getattr(meeting, "voice_id", None) in (None, "", "default"):
+                meeting.voice_id = default_context.voice_id
+        return meeting
+
+    def _get_table(self):
+        if not getattr(self.dao, "meeting_contexts_table", None):
+            raise RuntimeError("Meeting contexts table not initialized")
+        return self.dao.meeting_contexts_table
+
+    @staticmethod
+    def _item_to_meeting_context(item: Dict[str, Any]) -> MeetingContext:
+        """Convert DynamoDB item to MeetingContext."""
+        return MeetingContext(
+            id=UUID(item["id"]),
+            user_id=UUID(item["user_id"]),
+            name=item["name"],
+            voice_id=item["voice_id"],
+            context_description=item.get("context_description", ""),
+            tools_integrations=item.get("tools_integrations", []),
+            meeting_role=MeetingRole(item.get("meeting_role", MeetingRole.PARTICIPANT.value)),
+            tone_personality=TonePersonality(item.get("tone_personality", TonePersonality.FRIENDLY.value)),
+            custom_tone=item.get("custom_tone"),
+            is_default=item.get("is_default", False),
+            created_at=datetime.fromisoformat(item["created_at"]),
+            updated_at=datetime.fromisoformat(item["updated_at"]),
+        )
+
+
+__all__ = ["ServiceMeetingContext"]
+

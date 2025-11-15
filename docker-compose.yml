@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: aurray-dynamodb-local
+    ports:
+      - "8001:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    networks:
+      - aurray-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: aurray-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    networks:
+      - aurray-network
+
+volumes:
+  dynamodb-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  aurray-network:
+    driver: bridge
+

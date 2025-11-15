@@ -6,14 +6,18 @@ import subprocess
 import os
 from datetime import datetime, timedelta
 from typing import Optional
-from uuid import uuid4, UUID
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status, Depends, Header
 from pydantic import BaseModel
 
-from shared.schemas import JoinMeetingRequest, Meeting, MeetingPlatform, MeetingStatus
+from shared.schemas import JoinMeetingRequest, MeetingStatus, MeetingContext
 from services.api.dao import get_dao, DynamoDBDAO
 from shared.config import get_settings
+from services.meeting_agent.bot_orchestrator import get_bot_orchestrator
+from services.api.service_meeting import ServiceMeeting
+from services.api.service_meeting_context import ServiceMeetingContext
+from services.api.meeting_url import create_platform_meeting_url
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -35,88 +39,99 @@ class JoinMeetingResponse(BaseModel):
     capabilities: Optional[dict] = None
 
 
-async def _create_platform_meeting_url(platform: str, meeting_id: str) -> str:
+async def _launch_bot_subprocess_fallback(
+    meeting_id: str,
+    meeting_url: str,
+    platform: str,
+    bot_name: str,
+    meeting_id_external: str,
+    audio_record: bool
+) -> bool:
     """
-    Create a meeting URL using platform-specific clients.
+    FALLBACK: Launch browser bot using subprocess.Popen (original method).
     
-    Returns the join URL for the meeting.
+    This is kept as a backup option if you want to switch back from Docker/ECS orchestration.
+    To use this instead of the orchestrator, replace the orchestrator call in join_meeting()
+    with a call to this function.
+    
+    Returns True if process spawned successfully, False otherwise.
     """
-    platform_lower = platform.lower()
-    now = datetime.utcnow()
-    start_time = now.isoformat() + 'Z'
-    end_time = (now + timedelta(minutes=30)).isoformat() + 'Z'
-    
-    if platform_lower == "zoom":
+    try:
+        # Find bot entry script
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+        bot_path = os.path.join(base_dir, "browser_bot", "bot_entry.js")
+        
+        logger.info(f"Bot entry path: {bot_path}")
+        
+        if not os.path.exists(bot_path):
+            logger.error(f"Bot entry file not found at: {bot_path}")
+            return False
+        
+        # Normalize platform name for browser_bot
+        platform_for_bot = platform.lower()
+        if platform_for_bot == 'microsoft_teams':
+            platform_for_bot = 'teams'
+        
+        env_vars = {
+            'RT_GATEWAY_URL': os.getenv('RT_GATEWAY_URL'),
+            'API_BASE_URL': os.getenv('API_BASE_URL'),
+            'SESSION_ID': meeting_id,
+            'MEETING_URL': meeting_url,
+            'PLATFORM': platform_for_bot,
+            'BOT_NAME': bot_name,
+            'MEETING_ID': meeting_id_external,
+            'LOG_LEVEL': 'info',
+            'HEADLESS': 'true',
+            'ENABLE_TTS_PLAYBACK': 'true',
+            'ENABLE_AUDIO_CAPTURE': 'true' if audio_record else 'false',
+        }
+        
+        # Create log file paths
+        log_dir = os.path.join(base_dir, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f'bot_{meeting_id}.log')
+        
+        # Write startup info to log
+        with open(log_file, 'a') as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Bot process starting at {datetime.now().isoformat()}\n")
+            f.write(f"Environment: {', '.join([f'{k}={v}' for k, v in env_vars.items()])}\n")
+            f.write(f"{'='*80}\n")
+        
+        # Open log file for subprocess
+        log_fh = open(log_file, 'a', buffering=1)
+        
         try:
-            from services.meeting_agent.zoom_client import create_zoom_client
-            client = create_zoom_client()
-            await client.initialize()
-            res = await client.create_meeting(
-                title=f"Auray Zoom Meeting {meeting_id[:8]}",
-                start_time=start_time,
-                end_time=end_time,
-                attendees=[],
-                description="Created via webhook"
+            process = subprocess.Popen(
+                ['node', bot_path],
+                env={**os.environ, **env_vars},
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(bot_path),
+                start_new_session=True,
+                close_fds=False,
             )
-            if res.get("success"):
-                return res["meeting"]["join_url"]
-            else:
-                error_msg = res.get("error", "Zoom API call did not return a valid join URL")
-                logger.error(f"Zoom API call succeeded but didn't return a valid URL: {error_msg}")
-                raise HTTPException(status_code=500, detail=f"Failed to create Zoom meeting: {error_msg}")
+            
+            # Write PID to log
+            log_fh.write(f"Bot process PID: {process.pid}\n")
+            log_fh.flush()
+            
+            logger.info(f"Bot process spawned with PID: {process.pid}, log: {log_file}")
+            
+            # Keep file handle open (child process inherits it)
+            # Process is detached via start_new_session=True
+            
+            return True
+            
         except Exception as e:
-            logger.error(f"Zoom URL generation via API failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Zoom URL generation failed: {e}")
-    
-    elif platform_lower in ("teams", "microsoft_teams"):
-        try:
-            from services.meeting_agent.teams_client import create_teams_client
-            client = create_teams_client()
-            await client.initialize()
-            await client.authenticate()
-            res = await client.create_meeting(
-                title=f"Auray Teams Meeting {meeting_id[:8]}",
-                start_time=start_time,
-                end_time=end_time,
-                attendees=[],
-                description="Created via webhook"
-            )
-            if res.get("success"):
-                return res["meeting"]["join_url"]
-            else:
-                logger.warning(f"Teams API call failed: {res.get('error', 'Unknown error')}. Using fallback URL.")
-                # Fallback to static Teams meeting URL
-                return "https://teams.live.com/meet/9318960718018?p=J453ke6nEPHvg5kJGq"
-        except Exception as e:
-            logger.warning(f"Teams URL generation via API failed: {e}. Using fallback URL.")
-            # Fallback to static Teams meeting URL
-            return "https://teams.live.com/meet/9318960718018?p=J453ke6nEPHvg5kJGq"
-    
-    elif platform_lower == "google_meet":
-        try:
-            from services.meeting_agent.google_meet_client import create_google_meet_client
-            client = create_google_meet_client()
-            res = await client.create_meeting(
-                title=f"Auray Google Meet {meeting_id[:8]}",
-                start_time=start_time,
-                end_time=end_time,
-                attendees=[],
-                description="Created via webhook"
-            )
-            if res.get("success"):
-                return res["meeting"]["join_url"]
-            else:
-                error_msg = res.get("error", "Failed to create Google Meet")
-                logger.error(f"Google Meet creation failed: {error_msg}")
-                raise HTTPException(status_code=500, detail=f"Failed to create Google Meet: {error_msg}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Google Meet creation failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to create Google Meet: {e}")
-    
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform}")
+            log_fh.close()
+            logger.error(f"Failed to spawn bot process: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error in subprocess fallback: {e}")
+        return False
 
 
 async def get_user_from_api_key(
@@ -212,113 +227,80 @@ async def join_meeting(
         
         # current_user is already authenticated via dependency
         user_id = UUID(current_user["user_id"])
+
+        logger.info(f"User ID for join_meeting: {user_id}")
         
-        # Map platform string to enum
-        platform_map = {
-            "zoom": MeetingPlatform.ZOOM,
-            "teams": MeetingPlatform.MICROSOFT_TEAMS,
-            "microsoft_teams": MeetingPlatform.MICROSOFT_TEAMS,
-            "google_meet": MeetingPlatform.GOOGLE_MEET,
-        }
-        platform_enum = platform_map.get(request.type.lower(), MeetingPlatform.GOOGLE_MEET)
-        
-        # Generate meeting ID
-        meeting_id = uuid4()
-        meeting_id_str = str(meeting_id)
-        
-        # Create meeting URL using platform client
-        logger.info(f"Creating {request.type} meeting URL...")
-        meeting_url = await _create_platform_meeting_url(request.type, meeting_id_str)
-        
-        # Extract external meeting ID from URL
-        meeting_id_external = meeting_url.split("/")[-1].split("?")[0]
-        
-        # Create meeting record in database
-        now = datetime.utcnow()
-        meeting = Meeting(
-            id=meeting_id,
+        # Create meeting record in database via service
+        meeting_service = ServiceMeeting(dao)
+        meeting = await meeting_service.create_meeting_record(
             user_id=user_id,
-            platform=platform_enum,
-            meeting_url=meeting_url,
-            meeting_id_external=meeting_id_external,
-            title=f"Meeting {meeting_id_str[:8]}",
-            description="Created via webhook",
-            start_time=now,
-            end_time=now + timedelta(minutes=30),
-            organizer_email=settings.ai_email or "",
-            participants=[],
-            status=MeetingStatus.SCHEDULED,
-            ai_email=settings.ai_email or "",
-            audio_enabled=request.audio_record,
-            video_enabled=request.video_record,
-            recording_enabled=request.audio_record or request.video_record,
+            meeting_type=request.type,
+            meeting_url=request.meeting_url,
+            audio_record=request.audio_record,
+            video_record=request.video_record,
+            transcript=request.transcript,
+            voice_id=request.voice_id,
+            bot_name=request.bot_name,
+            context_id=request.context_id,
         )
         
-        meeting = await dao.create_meeting(meeting)
-        logger.info(f"Created meeting in DB: {meeting.id}")
         
-        # Prepare environment variables for bot
-        # Map SESSION_ID = meeting_id (as string)
-        # Map BOT_NAME = bot_name from request
-        # Browser bot is at the root level, not in clerk_backend
-        # __file__ is at: clerk_backend/services/api/routes/webhooks.py
-        # We need to go up 5 levels to get to the root: ../../../../../
-        # 1: routes/, 2: api/, 3: services/, 4: clerk_backend/, 5: root/
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
-        bot_path = os.path.join(base_dir, "browser_bot", "bot_entry.js")
-        
-        # Log the path for debugging
-        logger.info(f"Bot entry path: {bot_path}")
-        logger.info(f"Base directory: {base_dir}")
-        logger.info(f"Bot path exists: {os.path.exists(bot_path)}")
-        
-        if not os.path.exists(bot_path):
-            logger.error(f"Bot entry file not found at: {bot_path}")
-            meeting.status = MeetingStatus.FAILED
-            await dao.update_meeting(meeting)
-            raise HTTPException(status_code=500, detail=f"Bot entry file not found at: {bot_path}")
-        
-        env_vars = {
-            'RT_GATEWAY_URL': os.getenv('RT_GATEWAY_URL', 'ws://localhost:8001'),
-            'API_BASE_URL': os.getenv('API_BASE_URL', 'http://localhost:8000'),
-            'SESSION_ID': meeting_id_str,  # Map SESSION_ID = meeting_id
-            'MEETING_URL': meeting_url,
-            'PLATFORM': request.type.lower(),
-            'BOT_NAME': request.bot_name,  # Use bot_name from request
-            'MEETING_ID': meeting_id_external,
-            'LOG_LEVEL': 'info',
-            'HEADLESS': 'false',
-            'ENABLE_TTS_PLAYBACK': 'true',
-            'ENABLE_AUDIO_CAPTURE': 'true' if request.audio_record else 'false',
-        }
-        
-        # Spawn bot process
-        logger.info(f"Spawning bot process for meeting {meeting_id_str}...")
         try:
-            # Use subprocess.Popen to spawn process in background
-            process = subprocess.Popen(
-                ['node', bot_path],
-                env={**os.environ, **env_vars},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=os.path.dirname(bot_path)
+            meeting_id_str = str(meeting.id)
+            meeting_url = meeting.meeting_url
+            orchestrator = get_bot_orchestrator()
+            
+            # Prepare additional environment variables specific to this request
+            additional_env_vars = {
+                'MEETING_ID': meeting_id_str,  # External meeting ID from URL
+                'ENABLE_AUDIO_CAPTURE': 'true' if request.audio_record else 'false',
+                'ENABLE_TTS_PLAYBACK': 'true',
+            }
+            
+            # Add context_id if provided
+            if request.context_id:
+                additional_env_vars['CONTEXT_ID'] = request.context_id
+            
+            # Launch bot via orchestrator (will try Docker -> ECS -> subprocess in that order)
+            bot_launched = await orchestrator.launch_bot(
+                meeting_id=meeting_id_str,
+                platform=request.type,  # Will be normalized internally
+                meeting_url=meeting_url,
+                bot_name=request.bot_name,
+                session_id=meeting_id_str,  # Use meeting_id as session_id
+                additional_env_vars=additional_env_vars
             )
-            logger.info(f"Bot process spawned with PID: {process.pid}")
+            
+            if not bot_launched:
+                logger.error(f"Failed to launch browser bot for meeting: {meeting_id_str}")
+                meeting.status = MeetingStatus.FAILED
+                await meeting_service.update_meeting(meeting)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to launch browser bot. Check logs for details."
+                )
+            
+            logger.info(f"✅ Browser bot launched successfully for meeting: {meeting_id_str}")
+            
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Failed to spawn bot process: {e}")
-            # Update meeting status to failed
+            logger.error(f"❌ Failed to launch browser bot: {e}", exc_info=True)
             meeting.status = MeetingStatus.FAILED
-            await dao.update_meeting(meeting)
-            raise HTTPException(status_code=500, detail=f"Failed to spawn bot process: {str(e)}")
+            await meeting_service.update_meeting(meeting)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to launch browser bot: {str(e)}"
+            )
         
         # Update meeting status to JOINING
         meeting.status = MeetingStatus.JOINING
-        await dao.update_meeting(meeting)
+        await meeting_service.update_meeting(meeting)
         
         # Return response
-        return JoinMeetingResponse(
+        response = JoinMeetingResponse(
             success=True,
-            message=f"Successfully created and joined {request.type} meeting. AI assistant is now active.",
+            message=f"Successfully!! Aurray will join the meeting when let in into the meeting",
             status="active",
             timestamp=datetime.utcnow().isoformat(),
             meeting_id=meeting_id_str,
@@ -331,6 +313,8 @@ async def join_meeting(
                 "video_recording_enabled": request.video_record,
             }
         )
+        logger.info(f"Join meeting response: {response.model_dump()}")
+        return response
     
     except HTTPException:
         raise
@@ -339,5 +323,92 @@ async def join_meeting(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to join meeting: {str(e)}"
+        )
+
+
+@router.get("/voice_profiles")
+async def get_voice_profiles(
+    current_user: dict = Depends(get_user_from_api_key),
+):
+    """
+    Get available voice profiles webhook endpoint (public, secured by API key only).
+    
+    Returns a list of available voice profiles that can be used for TTS.
+    
+    Authentication: API key only (Bearer token with API key starting with 'sk_live_')
+    """
+    try:
+        logger.info("Get voice profiles request received")
+        
+        # For now, return only the default voice until voice profile setup is complete
+        voices = [
+            {
+                "id": "f5HLTX707KIM4SzJYzSz",
+                "name": "Aurray Alloy (default)",
+                "provider": "default",
+                "category": "default"
+            }
+        ]
+        
+        return {
+            "success": True,
+            "voices": voices,
+            "count": len(voices),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get voice profiles: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get voice profiles: {str(e)}"
+        )
+
+
+@router.get("/meeting_contexts")
+async def get_meeting_contexts_webhook(
+    current_user: dict = Depends(get_user_from_api_key),
+    dao: DynamoDBDAO = Depends(get_dao),
+):
+    """
+    Get meeting contexts webhook endpoint (public, secured by API key only).
+    
+    Returns a list of meeting contexts for the authenticated user.
+    
+    Authentication: API key only (Bearer token with API key starting with 'sk_live_')
+    """
+    try:
+        logger.info("Get meeting contexts request received")
+        user_id = current_user["user_id"]
+        context_service = ServiceMeetingContext(dao)
+        
+        contexts = await context_service.get_contexts_by_user(user_id)
+        
+        return {
+            "success": True,
+            "contexts": [
+                {
+                    "id": str(ctx.id),
+                    "name": ctx.name,
+                    "voice_id": ctx.voice_id,
+                    "context_description": ctx.context_description,
+                    "tools_integrations": ctx.tools_integrations,
+                    "meeting_role": ctx.meeting_role.value,
+                    "tone_personality": ctx.tone_personality.value,
+                    "custom_tone": ctx.custom_tone,
+                    "created_at": ctx.created_at.isoformat(),
+                    "updated_at": ctx.updated_at.isoformat(),
+                }
+                for ctx in contexts
+            ],
+            "count": len(contexts),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get meeting contexts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get meeting contexts: {str(e)}"
         )
 

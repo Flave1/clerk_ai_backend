@@ -4,7 +4,7 @@ Data Access Object for DynamoDB operations.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -13,7 +13,18 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from shared.config import get_settings
-from shared.schemas import (Action, ActionStatus, RoomInfo, User, Meeting, ApiKey, ApiKeyStatus)
+from shared.schemas import (
+    Action,
+    ActionStatus,
+    RoomInfo,
+    User,
+    Meeting,
+    ApiKey,
+    ApiKeyStatus,
+    UserIntegration,
+    IntegrationStatus,
+    NewsletterSubscription,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -29,27 +40,91 @@ class DynamoDBDAO:
         self.rooms_table = None
         self.meetings_table = None
         self.api_keys_table = None
+        self.user_integrations_table = None
+        self.meeting_contexts_table = None
+        self.newsletter_table = None
         self.initialized = False
 
     async def initialize(self):
         """Initialize DynamoDB client and tables."""
         try:
-            if settings.aws_access_key_id:
-                self.dynamodb = boto3.resource(
-                    "dynamodb",
-                    region_name=settings.aws_region,
-                    aws_access_key_id=settings.aws_access_key_id,
-                    aws_secret_access_key=settings.aws_secret_access_key,
-                )
-                logger.info("🌐 DynamoDB: Connected to AWS (ONLINE)")
-            else:
-                # Use local DynamoDB for development
-                self.dynamodb = boto3.resource(
-                    "dynamodb",
-                    region_name=settings.aws_region,
-                    endpoint_url="http://localhost:8001",
-                )
-                logger.info("🏠 DynamoDB: Connected to Local (OFFLINE)")
+            # Determine if we should use local DynamoDB
+            use_local = settings.use_local_dynamodb
+            
+            # Auto-detect: if USE_LOCAL_DYNAMODB is not explicitly set and AWS credentials are missing,
+            # try local DynamoDB first
+            if not use_local and not settings.aws_access_key_id:
+                logger.info("No AWS credentials found. Attempting to use local DynamoDB...")
+                use_local = True
+            
+            # Try local DynamoDB first if configured
+            if use_local:
+                try:
+                    logger.info(f"Attempting to connect to local DynamoDB at {settings.dynamodb_local_endpoint}")
+                    self.dynamodb = boto3.resource(
+                        "dynamodb",
+                        region_name=settings.aws_region,
+                        endpoint_url=settings.dynamodb_local_endpoint,
+                        aws_access_key_id="dummy",  # Required for local DynamoDB
+                        aws_secret_access_key="dummy",  # Required for local DynamoDB
+                    )
+                    # Test connection by listing tables
+                    list(self.dynamodb.tables.limit(1))
+                    logger.info(f"✅ DynamoDB: Connected to LOCAL DynamoDB at {settings.dynamodb_local_endpoint} (ONLINE)")
+                except Exception as local_error:
+                    if settings.use_local_dynamodb:
+                        # If explicitly set to use local, fail
+                        logger.error(f"❌ Failed to connect to local DynamoDB: {local_error}")
+                        logger.error("Please ensure local DynamoDB is running:")
+                        logger.error(f"  1. Start DynamoDB Local: docker-compose up -d dynamodb")
+                        logger.error(f"  2. Or set DYNAMODB_LOCAL_ENDPOINT if using a different endpoint")
+                        raise RuntimeError(f"Failed to connect to local DynamoDB: {local_error}")
+                    else:
+                        # If auto-detecting, fall back to AWS
+                        logger.warning(f"⚠️  Local DynamoDB not available at {settings.dynamodb_local_endpoint}, falling back to AWS")
+                        use_local = False
+            
+            # Use AWS DynamoDB if local is not being used
+            if not use_local:
+                if settings.aws_access_key_id:
+                    # Use AWS credentials if provided
+                    logger.info(f"Using AWS credentials for DynamoDB connection (Region: {settings.aws_region})")
+                    try:
+                        self.dynamodb = boto3.resource(
+                            "dynamodb",
+                            region_name=settings.aws_region,
+                            aws_access_key_id=settings.aws_access_key_id,
+                            aws_secret_access_key=settings.aws_secret_access_key,
+                        )
+                        # Test connection by listing tables
+                        list(self.dynamodb.tables.limit(1))
+                        logger.info("🌐 DynamoDB: Connected to AWS using credentials (ONLINE)")
+                    except Exception as cred_error:
+                        logger.error(f"❌ Failed to connect to AWS DynamoDB using credentials: {cred_error}")
+                        logger.error("Please check:")
+                        logger.error("  1. AWS credentials are valid")
+                        logger.error("  2. AWS region is correct")
+                        logger.error("  3. Network connectivity to AWS services")
+                        raise RuntimeError(f"Failed to connect to AWS DynamoDB: {cred_error}")
+                else:
+                    # Try using IAM role (for ECS/Lambda)
+                    logger.info(f"Attempting to use IAM role for DynamoDB (Region: {settings.aws_region})")
+                    try:
+                        self.dynamodb = boto3.resource(
+                            "dynamodb",
+                            region_name=settings.aws_region,
+                        )
+                        # Test connection by listing tables
+                        list(self.dynamodb.tables.limit(1))
+                        logger.info("🌐 DynamoDB: Connected to AWS using IAM role (ONLINE)")
+                    except Exception as iam_error:
+                        logger.error(f"❌ Failed to connect to AWS DynamoDB using IAM role: {iam_error}")
+                        logger.error("Please check:")
+                        logger.error("  1. IAM role has DynamoDB permissions")
+                        logger.error("  2. AWS credentials are set in Secrets Manager")
+                        logger.error("  3. Network connectivity to AWS services")
+                        logger.error("  4. Or set USE_LOCAL_DYNAMODB=true to use local DynamoDB")
+                        raise RuntimeError(f"Failed to connect to AWS DynamoDB: {iam_error}")
 
             # Get table references
             self.actions_table = self.dynamodb.Table(
@@ -67,12 +142,38 @@ class DynamoDBDAO:
             self.api_keys_table = self.dynamodb.Table(
                 f"{settings.dynamodb_table_prefix}{settings.api_keys_table}"
             )
+            
+            self.user_integrations_table = self.dynamodb.Table(
+                f"{settings.dynamodb_table_prefix}{settings.user_integrations_table}"
+            )
+            self.meeting_contexts_table = self.dynamodb.Table(
+                f"{settings.dynamodb_table_prefix}{settings.meeting_contexts_table}"
+            )
+            self.newsletter_table = self.dynamodb.Table(
+                f"{settings.dynamodb_table_prefix}{settings.newsletter_table}"
+            )
+
+            # Test connection by trying to describe one table
+            try:
+                self.users_table.load()
+                logger.info(f"✅ Successfully connected to table: {self.users_table.table_name}")
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                    logger.warning(f"⚠️  Table {self.users_table.table_name} does not exist. Please create it first.")
+                else:
+                    logger.error(f"❌ Error accessing table {self.users_table.table_name}: {e}")
+                    raise
 
             self.initialized = True
-            logger.info("DynamoDB DAO initialized successfully")
+            logger.info("✅ DynamoDB DAO initialized successfully")
 
         except Exception as e:
-            logger.error(f"Failed to initialize DynamoDB DAO: {e}")
+            logger.error(f"❌ Failed to initialize DynamoDB DAO: {e}", exc_info=True)
+            logger.error("Please check:")
+            logger.error("  1. AWS credentials are set (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)")
+            logger.error("  2. IAM role has DynamoDB permissions (if using ECS/Lambda)")
+            logger.error("  3. AWS region is configured (AWS_REGION)")
+            logger.error("  4. Network connectivity to AWS services")
             raise
 
     # Action operations
@@ -145,6 +246,94 @@ class DynamoDBDAO:
 
         except Exception as e:
             logger.error(f"Failed to get action {action_id}: {e}")
+            raise
+
+    # Newsletter operations
+    async def get_newsletter_signup(self, email: str) -> Optional[NewsletterSubscription]:
+        """Retrieve a newsletter subscription by email."""
+        if not self.newsletter_table:
+            raise RuntimeError("Newsletter table is not initialized")
+
+        try:
+            response = self.newsletter_table.get_item(Key={"email": email.lower()})
+            item = response.get("Item")
+            if not item:
+                return None
+
+            signed_up_at = (
+                datetime.fromisoformat(item["signed_up_at"])
+                if isinstance(item.get("signed_up_at"), str)
+                else datetime.utcnow()
+            )
+
+            return NewsletterSubscription(
+                email=item["email"],
+                name=item.get("name", ""),
+                country=item.get("country", ""),
+                signed_up_at=signed_up_at,
+            )
+        except Exception as e:
+            logger.error(f"Failed to get newsletter signup for {email}: {e}")
+            raise
+
+    async def add_newsletter_signup(self, signup: NewsletterSubscription) -> NewsletterSubscription:
+        """Create a new newsletter subscription."""
+        if not self.newsletter_table:
+            raise RuntimeError("Newsletter table is not initialized")
+
+        item = {
+            "email": signup.email.lower(),
+            "name": signup.name,
+            "country": signup.country,
+            "signed_up_at": signup.signed_up_at.isoformat(),
+        }
+
+        try:
+            self.newsletter_table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(email)",
+            )
+            return signup
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                logger.info("Newsletter signup already exists for email %s", signup.email)
+                raise ValueError("Email already exists in newsletter")
+            logger.error(f"Failed to add newsletter signup: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to add newsletter signup: {e}")
+            raise
+
+    async def list_newsletter_signups(self) -> List[NewsletterSubscription]:
+        """List all newsletter subscriptions."""
+        if not self.newsletter_table:
+            raise RuntimeError("Newsletter table is not initialized")
+
+        try:
+            response = self.newsletter_table.scan()
+            items = response.get("Items", [])
+
+            signups: List[NewsletterSubscription] = []
+            for item in items:
+                signed_up_at = (
+                    datetime.fromisoformat(item["signed_up_at"])
+                    if isinstance(item.get("signed_up_at"), str)
+                    else datetime.utcnow()
+                )
+                signups.append(
+                    NewsletterSubscription(
+                        email=item.get("email", ""),
+                        name=item.get("name", ""),
+                        country=item.get("country", ""),
+                        signed_up_at=signed_up_at,
+                    )
+                )
+
+            # Sort by newest first
+            signups.sort(key=lambda s: s.signed_up_at, reverse=True)
+            return signups
+        except Exception as e:
+            logger.error(f"Failed to list newsletter signups: {e}")
             raise
 
     async def update_action(self, action: Action) -> Action:
@@ -265,398 +454,6 @@ class DynamoDBDAO:
         except Exception as e:
             logger.error(f"Failed to delete room: {e}")
             raise
-
-    # Meeting operations
-    async def create_meeting(self, meeting: Meeting) -> Meeting:
-        """Create a new meeting."""
-        try:
-            # Convert participants to DynamoDB format
-            participants_data = []
-            for participant in meeting.participants:
-                participants_data.append({
-                    "email": participant.email,
-                    "name": participant.name,
-                    "is_organizer": participant.is_organizer,
-                    "response_status": participant.response_status
-                })
-
-            item = {
-                "id": str(meeting.id),
-                "user_id": str(meeting.user_id) if meeting.user_id else "",
-                "platform": meeting.platform.value,
-                "meeting_url": meeting.meeting_url,
-                "meeting_id_external": meeting.meeting_id_external,
-                "title": meeting.title,
-                "description": meeting.description or "",
-                "start_time": meeting.start_time.isoformat(),
-                "end_time": meeting.end_time.isoformat(),
-                "organizer_email": meeting.organizer_email,
-                "participants": participants_data,
-                "status": meeting.status.value,
-                "ai_email": meeting.ai_email,
-                "transcription_chunks": meeting.transcription_chunks or [],
-                "full_transcription": meeting.full_transcription or "",
-                "summary": meeting.summary or "",
-                "calendar_event_id": meeting.calendar_event_id or "",
-                "join_attempts": meeting.join_attempts,
-                "last_join_attempt": meeting.last_join_attempt.isoformat() if meeting.last_join_attempt else "",
-                "error_message": meeting.error_message or "",
-                "created_at": meeting.created_at.isoformat(),
-                "updated_at": meeting.updated_at.isoformat(),
-                "joined_at": meeting.joined_at.isoformat() if meeting.joined_at else "",
-                "ended_at": meeting.ended_at.isoformat() if meeting.ended_at else "",
-                "audio_enabled": meeting.audio_enabled,
-                "video_enabled": meeting.video_enabled,
-                "recording_enabled": meeting.recording_enabled,
-                "bot_joined": meeting.bot_joined,
-            }
-
-            self.meetings_table.put_item(Item=item)
-            logger.info(f"Created meeting: {meeting.id}")
-            return meeting
-
-        except Exception as e:
-            logger.error(f"Failed to create meeting: {e}")
-            raise
-
-    async def get_meeting(self, meeting_id: str) -> Optional[Meeting]:
-        """Get a meeting by ID."""
-        try:
-            response = self.meetings_table.get_item(Key={"id": meeting_id})
-            
-            if "Item" not in response:
-                return None
-
-            item = response["Item"]
-            return self._item_to_meeting(item)
-
-        except Exception as e:
-            logger.error(f"Failed to get meeting: {e}")
-            raise
-
-    async def get_meetings(self, limit: int = 10, user_id: Optional[str] = None) -> List[Meeting]:
-        """Get meetings with pagination. Optionally filter by user_id."""
-        try:
-            if user_id:
-                # Use GSI to query by user_id
-                response = self.meetings_table.query(
-                    IndexName="user-id-start-time-index",
-                    KeyConditionExpression=Key("user_id").eq(user_id),
-                    ScanIndexForward=False,  # Sort by start_time descending
-                    Limit=limit
-                )
-                items = response.get("Items", [])
-            else:
-                response = self.meetings_table.scan(Limit=limit)
-                items = response.get("Items", [])
-            
-            meetings = []
-            for item in items:
-                meetings.append(self._item_to_meeting(item))
-            
-            return meetings
-
-        except Exception as e:
-            logger.error(f"Failed to get meetings: {e}")
-            raise
-
-    async def get_meeting_by_url(self, meeting_url: str) -> Optional[Meeting]:
-        """Get a meeting by URL."""
-        try:
-            # Scan through meetings to find one matching the URL
-            # Note: This is inefficient for large datasets. Consider adding a GSI on meeting_url
-            response = self.meetings_table.scan(
-                FilterExpression=Attr('meeting_url').eq(meeting_url),
-                Limit=1
-            )
-            
-            if "Items" not in response or len(response["Items"]) == 0:
-                return None
-            
-            item = response["Items"][0]
-            return self._item_to_meeting(item)
-
-        except Exception as e:
-            logger.error(f"Failed to get meeting by URL: {e}")
-            raise
-
-    async def delete_meeting(self, meeting_id: str) -> bool:
-        """Delete a meeting from DynamoDB."""
-        try:
-            self.meetings_table.delete_item(Key={"id": meeting_id})
-            logger.info(f"Deleted meeting: {meeting_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to delete meeting {meeting_id}: {e}")
-            raise
-
-    async def update_meeting(self, meeting: Meeting) -> Meeting:
-        """Update a meeting in DynamoDB."""
-        try:
-            # Convert participants to dict
-            participants_data = [
-                {
-                    "email": p.email,
-                    "name": p.name,
-                    "is_organizer": p.is_organizer,
-                    "response_status": p.response_status
-                }
-                for p in (meeting.participants or [])
-            ]
-            
-            # Convert summary to dict if it's a MeetingSummary object
-            summary_data = None
-            if meeting.summary:
-                if hasattr(meeting.summary, 'dict'):
-                    # It's a Pydantic model, convert to dict
-                    summary_dict = meeting.summary.dict()
-                    # Convert UUIDs and datetimes to strings
-                    summary_data = {
-                        "meeting_id": str(summary_dict["meeting_id"]),
-                        "topics_discussed": summary_dict.get("topics_discussed", []),
-                        "key_decisions": summary_dict.get("key_decisions", []),
-                        "action_items": [
-                            {
-                                "description": ai.get("description", ""),
-                                "assignee": ai.get("assignee"),
-                                "priority": ai.get("priority", "medium"),
-                                "due_date": ai.get("due_date").isoformat() if ai.get("due_date") else None
-                            }
-                            for ai in summary_dict.get("action_items", [])
-                        ],
-                        "summary_text": summary_dict.get("summary_text", ""),
-                        "sentiment": summary_dict.get("sentiment", "neutral"),
-                        "duration_minutes": summary_dict.get("duration_minutes"),
-                        "created_at": summary_dict["created_at"].isoformat() if summary_dict.get("created_at") else None
-                    }
-                elif isinstance(meeting.summary, dict):
-                    # Already a dict
-                    summary_data = meeting.summary
-            
-            # Prepare update data
-            item = {
-                "id": str(meeting.id),
-                "user_id": str(meeting.user_id) if meeting.user_id else "",
-                "platform": meeting.platform.value,
-                "meeting_url": meeting.meeting_url,
-                "meeting_id_external": meeting.meeting_id_external,
-                "title": meeting.title,
-                "description": meeting.description,
-                "start_time": meeting.start_time.isoformat(),
-                "end_time": meeting.end_time.isoformat(),
-                "organizer_email": meeting.organizer_email,
-                "participants": participants_data,
-                "status": meeting.status.value,
-                "ai_email": meeting.ai_email,
-                "transcription_chunks": meeting.transcription_chunks or [],
-                "full_transcription": meeting.full_transcription or "",
-                "summary": summary_data,
-                "calendar_event_id": meeting.calendar_event_id or "",
-                "join_attempts": meeting.join_attempts,
-                "last_join_attempt": meeting.last_join_attempt.isoformat() if meeting.last_join_attempt else None,
-                "error_message": meeting.error_message or "",
-                "bot_joined": meeting.bot_joined,
-                "created_at": meeting.created_at.isoformat(),
-                "updated_at": meeting.updated_at.isoformat(),
-                "joined_at": meeting.joined_at.isoformat() if meeting.joined_at else None,
-                "ended_at": meeting.ended_at.isoformat() if meeting.ended_at else None,
-                "audio_enabled": meeting.audio_enabled,
-                "video_enabled": meeting.video_enabled,
-                "recording_enabled": meeting.recording_enabled,
-            }
-            
-            # Remove None values
-            item = {k: v for k, v in item.items() if v is not None}
-            
-            # Update in DynamoDB
-            self.meetings_table.put_item(Item=item)
-            logger.info(f"Updated meeting: {meeting.id}")
-            
-            return meeting
-
-        except Exception as e:
-            logger.error(f"Failed to update meeting: {e}")
-            raise
-
-    def _item_to_meeting(self, item: Dict[str, Any]) -> Meeting:
-        """Convert DynamoDB item to Meeting object."""
-        from shared.schemas import MeetingParticipant, MeetingPlatform, MeetingStatus
-        from datetime import datetime
-        
-        # Convert participants
-        participants = []
-        for p in item.get("participants", []):
-            participants.append(MeetingParticipant(
-                email=p["email"],
-                name=p["name"],
-                is_organizer=p["is_organizer"],
-                response_status=p["response_status"]
-            ))
-
-        # Handle summary field - convert old dict format to MeetingSummary if needed
-        summary_data = item.get("summary")
-        summary = None
-        if summary_data:
-            # Check if it's already a MeetingSummary object or needs conversion
-            if isinstance(summary_data, dict):
-                # Old format - convert to MeetingSummary with meeting_id
-                if "meeting_id" not in summary_data:
-                    # Add missing meeting_id for backward compatibility
-                    summary_data["meeting_id"] = item["id"]
-                try:
-                    from shared.schemas import MeetingSummary, ActionItem
-                    # Convert action_items dicts to ActionItem objects if needed
-                    action_items = []
-                    for ai in summary_data.get("action_items", []):
-                        if isinstance(ai, dict):
-                            action_items.append(ActionItem(**ai))
-                        else:
-                            action_items.append(ai)
-                    
-                    summary = MeetingSummary(
-                        meeting_id=summary_data.get("meeting_id", item["id"]),
-                        topics_discussed=summary_data.get("topics_discussed", summary_data.get("topics", [])),
-                        key_decisions=summary_data.get("key_decisions", summary_data.get("decisions", [])),
-                        action_items=action_items,
-                        summary_text=summary_data.get("summary_text", ""),
-                        sentiment=summary_data.get("sentiment", "neutral"),
-                        duration_minutes=summary_data.get("duration_minutes"),
-                        created_at=datetime.fromisoformat(summary_data["created_at"]) if summary_data.get("created_at") else datetime.utcnow()
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to parse summary for meeting {item['id']}: {e}")
-                    summary = None
-            else:
-                summary = summary_data
-
-        return Meeting(
-            id=item["id"],
-            user_id=UUID(item["user_id"]) if item.get("user_id") else None,
-            platform=MeetingPlatform(item["platform"]),
-            meeting_url=item["meeting_url"],
-            meeting_id_external=item["meeting_id_external"],
-            title=item["title"],
-            description=item.get("description", ""),
-            start_time=datetime.fromisoformat(item["start_time"]),
-            end_time=datetime.fromisoformat(item["end_time"]),
-            organizer_email=item["organizer_email"],
-            participants=participants,
-            status=MeetingStatus(item["status"]),
-            ai_email=item["ai_email"],
-            transcription_chunks=item.get("transcription_chunks", []),
-            full_transcription=item.get("full_transcription", ""),
-            summary=summary,
-            calendar_event_id=item.get("calendar_event_id", ""),
-            join_attempts=item.get("join_attempts", 0),
-            last_join_attempt=datetime.fromisoformat(item["last_join_attempt"]) if item.get("last_join_attempt") else None,
-            error_message=item.get("error_message", ""),
-            created_at=datetime.fromisoformat(item["created_at"]),
-            updated_at=datetime.fromisoformat(item["updated_at"]),
-            joined_at=datetime.fromisoformat(item["joined_at"]) if item.get("joined_at") else None,
-            ended_at=datetime.fromisoformat(item["ended_at"]) if item.get("ended_at") else None,
-            audio_enabled=item.get("audio_enabled", True),
-            video_enabled=item.get("video_enabled", False),
-            recording_enabled=item.get("recording_enabled", False),
-            bot_joined=item.get("bot_joined", False),
-        )
-
-    async def add_meeting_participant(self, meeting_id: str, participant: Dict[str, Any]) -> bool:
-        """Add a participant to a meeting."""
-        try:
-            if not self.meetings_table:
-                logger.warning("Meetings table not initialized")
-                return False
-            
-            # Get the meeting first
-            response = self.meetings_table.get_item(
-                Key={'id': meeting_id}
-            )
-            
-            if 'Item' not in response:
-                logger.error(f"Meeting {meeting_id} not found")
-                return False
-            
-            meeting = response['Item']
-            
-            # Initialize participants list if it doesn't exist
-            if 'participants' not in meeting:
-                meeting['participants'] = []
-            
-            # Add the new participant
-            meeting['participants'].append(participant)
-            meeting['participant_count'] = len(meeting['participants'])
-            meeting['updated_at'] = datetime.utcnow().isoformat()
-            
-            # Update the meeting
-            self.meetings_table.put_item(Item=meeting)
-            
-            logger.info(f"Added participant {participant['id']} to meeting {meeting_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error adding meeting participant: {e}")
-            return False
-
-    async def remove_meeting_participant(self, meeting_id: str, participant_id: str) -> bool:
-        """Remove a participant from a meeting."""
-        try:
-            if not self.meetings_table:
-                logger.warning("Meetings table not initialized")
-                return False
-            
-            # Get the meeting first
-            response = self.meetings_table.get_item(
-                Key={'id': meeting_id}
-            )
-            
-            if 'Item' not in response:
-                logger.error(f"Meeting {meeting_id} not found")
-                return False
-            
-            meeting = response['Item']
-            
-            # Remove the participant
-            if 'participants' in meeting:
-                meeting['participants'] = [
-                    p for p in meeting['participants'] 
-                    if p['id'] != participant_id
-                ]
-                meeting['participant_count'] = len(meeting['participants'])
-                meeting['updated_at'] = datetime.utcnow().isoformat()
-                
-                # Update the meeting
-                self.meetings_table.put_item(Item=meeting)
-                
-                logger.info(f"Removed participant {participant_id} from meeting {meeting_id}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error removing meeting participant: {e}")
-            return False
-
-    async def get_meeting_participants(self, meeting_id: str) -> List[Dict[str, Any]]:
-        """Get all participants for a meeting."""
-        try:
-            if not self.meetings_table:
-                logger.warning("Meetings table not initialized")
-                return []
-            
-            response = self.meetings_table.get_item(
-                Key={'id': meeting_id}
-            )
-            
-            if 'Item' not in response:
-                logger.error(f"Meeting {meeting_id} not found")
-                return []
-            
-            meeting = response['Item']
-            return meeting.get('participants', [])
-            
-        except Exception as e:
-            logger.error(f"Error getting meeting participants: {e}")
-            return []
 
     # User operations
     async def create_user(self, user: User) -> User:
@@ -1027,6 +824,174 @@ class DynamoDBDAO:
         except Exception as e:
             logger.error(f"Failed to delete API key {api_key_id}: {e}")
             raise
+
+    # User Integration operations
+    async def create_user_integration(self, user_integration: UserIntegration) -> UserIntegration:
+        """Create a new user integration."""
+        try:
+            if not self.user_integrations_table:
+                raise RuntimeError("User integrations table not initialized")
+            
+            item = {
+                "id": str(user_integration.id),
+                "user_id": str(user_integration.user_id),
+                "integration_id": user_integration.integration_id,
+                "status": user_integration.status.value,
+                "access_token": user_integration.access_token or "",
+                "refresh_token": user_integration.refresh_token or "",
+                "token_type": user_integration.token_type,
+                "expires_at": user_integration.expires_at.isoformat() if user_integration.expires_at else None,
+                "scope": user_integration.scope or "",
+                "connected_at": user_integration.connected_at.isoformat() if user_integration.connected_at else None,
+                "last_used_at": user_integration.last_used_at.isoformat() if user_integration.last_used_at else None,
+                "last_refreshed_at": user_integration.last_refreshed_at.isoformat() if user_integration.last_refreshed_at else None,
+                "error_message": user_integration.error_message or "",
+                "metadata": json.dumps(user_integration.metadata),
+                "created_at": user_integration.created_at.isoformat(),
+                "updated_at": user_integration.updated_at.isoformat(),
+            }
+            
+            self.user_integrations_table.put_item(Item=item)
+            logger.info(f"Created user integration: {user_integration.id} ({user_integration.integration_id})")
+            return user_integration
+
+        except Exception as e:
+            logger.error(f"Failed to create user integration: {e}")
+            raise
+
+    async def get_user_integration(self, user_id: str, integration_id: str) -> Optional[UserIntegration]:
+        """Get a user integration by user_id and integration_id."""
+        try:
+            if not self.user_integrations_table:
+                raise RuntimeError("User integrations table not initialized")
+            
+            # Query by user_id using GSI, then filter by integration_id
+            response = self.user_integrations_table.query(
+                IndexName="user-id-index",
+                KeyConditionExpression=Key("user_id").eq(user_id),
+                FilterExpression=Attr("integration_id").eq(integration_id),
+            )
+            
+            items = response.get("Items", [])
+            if not items:
+                return None
+            
+            item = items[0]
+            return UserIntegration(
+                id=UUID(item["id"]),
+                user_id=UUID(item["user_id"]),
+                integration_id=item["integration_id"],
+                status=IntegrationStatus(item["status"]),
+                access_token=item.get("access_token") or None,
+                refresh_token=item.get("refresh_token") or None,
+                token_type=item.get("token_type", "Bearer"),
+                expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
+                scope=item.get("scope") or None,
+                connected_at=datetime.fromisoformat(item["connected_at"]) if item.get("connected_at") else None,
+                last_used_at=datetime.fromisoformat(item["last_used_at"]) if item.get("last_used_at") else None,
+                last_refreshed_at=datetime.fromisoformat(item["last_refreshed_at"]) if item.get("last_refreshed_at") else None,
+                error_message=item.get("error_message") or None,
+                metadata=json.loads(item.get("metadata", "{}")),
+                created_at=datetime.fromisoformat(item["created_at"]),
+                updated_at=datetime.fromisoformat(item["updated_at"]),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get user integration: {e}")
+            return None
+
+    async def get_user_integrations_by_user(self, user_id: str) -> List[UserIntegration]:
+        """Get all integrations for a user."""
+        try:
+            if not self.user_integrations_table:
+                raise RuntimeError("User integrations table not initialized")
+            
+            response = self.user_integrations_table.query(
+                IndexName="user-id-index",
+                KeyConditionExpression=Key("user_id").eq(user_id),
+                ScanIndexForward=False,
+            )
+            
+            integrations = []
+            for item in response.get("Items", []):
+                integrations.append(UserIntegration(
+                    id=UUID(item["id"]),
+                    user_id=UUID(item["user_id"]),
+                    integration_id=item["integration_id"],
+                    status=IntegrationStatus(item["status"]),
+                    access_token=item.get("access_token") or None,
+                    refresh_token=item.get("refresh_token") or None,
+                    token_type=item.get("token_type", "Bearer"),
+                    expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
+                    scope=item.get("scope") or None,
+                    connected_at=datetime.fromisoformat(item["connected_at"]) if item.get("connected_at") else None,
+                    last_used_at=datetime.fromisoformat(item["last_used_at"]) if item.get("last_used_at") else None,
+                    last_refreshed_at=datetime.fromisoformat(item["last_refreshed_at"]) if item.get("last_refreshed_at") else None,
+                    error_message=item.get("error_message") or None,
+                    metadata=json.loads(item.get("metadata", "{}")),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                    updated_at=datetime.fromisoformat(item["updated_at"]),
+                ))
+            
+            return integrations
+
+        except Exception as e:
+            logger.error(f"Failed to get user integrations: {e}")
+            return []
+
+    async def update_user_integration(self, user_integration: UserIntegration) -> UserIntegration:
+        """Update a user integration."""
+        try:
+            if not self.user_integrations_table:
+                raise RuntimeError("User integrations table not initialized")
+            
+            item = {
+                "id": str(user_integration.id),
+                "user_id": str(user_integration.user_id),
+                "integration_id": user_integration.integration_id,
+                "status": user_integration.status.value,
+                "access_token": user_integration.access_token or "",
+                "refresh_token": user_integration.refresh_token or "",
+                "token_type": user_integration.token_type,
+                "expires_at": user_integration.expires_at.isoformat() if user_integration.expires_at else None,
+                "scope": user_integration.scope or "",
+                "connected_at": user_integration.connected_at.isoformat() if user_integration.connected_at else None,
+                "last_used_at": user_integration.last_used_at.isoformat() if user_integration.last_used_at else None,
+                "last_refreshed_at": user_integration.last_refreshed_at.isoformat() if user_integration.last_refreshed_at else None,
+                "error_message": user_integration.error_message or "",
+                "metadata": json.dumps(user_integration.metadata),
+                "created_at": user_integration.created_at.isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            
+            self.user_integrations_table.put_item(Item=item)
+            logger.info(f"Updated user integration: {user_integration.id}")
+            return user_integration
+
+        except Exception as e:
+            logger.error(f"Failed to update user integration: {e}")
+            raise
+
+    async def delete_user_integration(self, integration_id: str, user_id: str) -> bool:
+        """Delete a user integration."""
+        try:
+            if not self.user_integrations_table:
+                raise RuntimeError("User integrations table not initialized")
+            
+            # First, get the integration to find its ID
+            user_integration = await self.get_user_integration(user_id, integration_id)
+            if not user_integration:
+                return False
+            
+            self.user_integrations_table.delete_item(
+                Key={"id": str(user_integration.id)}
+            )
+            logger.info(f"Deleted user integration: {user_integration.id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to delete user integration: {e}")
+            return False
 
 
 # Dependency injection

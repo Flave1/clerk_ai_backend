@@ -1,15 +1,13 @@
 """
 External Turn Manager for Meeting Bot.
-Redis-based turn management specifically designed for meeting bot sessions.
+Originally Redis-backed, now defaults to in-memory turn management for sessions.
 """
 import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4, UUID
-
-import redis.asyncio as redis
 
 from shared.config import get_settings
 from shared.schemas import Turn, TurnType
@@ -27,26 +25,13 @@ class ExternalTurnManager:
     def __init__(self, llm_service):
         """Initialize the external turn manager."""
         self.llm_service = llm_service
-        self.redis_client: Optional[redis.Redis] = None
+        self.redis_client: Optional[Any] = None
         self.sessions: Dict[str, dict] = {}  # In-memory session metadata
         self.ttl_hours = 24  # TTL for Redis data
         
     async def initialize(self):
         """Initialize Redis connection."""
-        try:
-            # Connect to Redis using config URL
-            self.redis_client = await redis.from_url(
-                settings.redis_url,
-                encoding="utf-8",
-                decode_responses=True
-            )
-            # Test connection
-            await self.redis_client.ping()
-            logger.info(f"✅ External turn manager initialized with Redis: {settings.redis_url}")
-        except Exception as e:
-            logger.error(f"Failed to initialize Redis: {e}")
-            logger.warning("⚠️ External turn manager will use in-memory storage only")
-            self.redis_client = None
+        logger.info("External turn manager running in in-memory mode")
     
     async def cleanup(self):
         """Close Redis connection."""

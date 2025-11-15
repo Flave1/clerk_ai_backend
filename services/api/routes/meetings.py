@@ -25,6 +25,8 @@ from pydantic import BaseModel
 from services.meeting_agent.scheduler import create_meeting_scheduler
 from services.meeting_agent.notifier import create_notification_service
 from services.meeting_agent.summarization_service import create_summarization_service
+from services.api.service_meeting import ServiceMeeting
+from services.api.service_meeting_context import ServiceMeetingContext
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -48,6 +50,13 @@ class BotJoinedRequest(BaseModel):
     meeting_url: Optional[str] = None
 
 
+class BotLeftRequest(BaseModel):
+    """Payload sent by browser bot when it leaves a meeting."""
+    sessionId: str
+    timestamp: Optional[str] = None
+    reason: Optional[str] = None
+
+
 class GenerateMeetingUrlRequest(BaseModel):
     """Request to generate a meeting URL for a platform."""
     platform: str  # one of: clerk | teams | zoom | google_meet
@@ -65,6 +74,10 @@ notification_service = create_notification_service()
 summarization_service = create_summarization_service()
 
 
+def get_meeting_service(dao: DynamoDBDAO) -> ServiceMeeting:
+    return ServiceMeeting(dao)
+
+
 @router.get("/", response_model=List[Meeting])
 async def get_meetings(
     status: Optional[MeetingStatus] = None,
@@ -78,7 +91,8 @@ async def get_meetings(
     try:
         # Query DynamoDB for meetings filtered by user_id
         user_id = current_user["user_id"]
-        meetings = await dao.get_meetings(limit=limit + offset, user_id=user_id)
+        meeting_service = get_meeting_service(dao)
+        meetings = await meeting_service.get_meetings(limit=limit + offset, user_id=user_id)
         
         # Add filtering logic
         if status:
@@ -122,7 +136,7 @@ async def bot_joined(
 ):
     """
     Confirm a bot has joined a meeting and mark the meeting as bot_joined.
-    Accepts meeting_url in the request body to find/create meeting if meeting_id doesn't exist.
+    Updates the meeting status to ACTIVE and sets bot_joined flag.
     """
     try:
         logger.info(
@@ -132,107 +146,100 @@ async def bot_joined(
                 "session_id": request.sessionId,
                 "platform": request.platform,
                 "bot_name": request.botName,
-                "meeting_url": request.meeting_url,
                 "timestamp": request.timestamp or datetime.utcnow().isoformat(),
             },
         )
 
-        meeting = None
-        
-        # First try to get meeting by ID
-        try:
-            meeting = await dao.get_meeting(meeting_id)
-        except Exception as e:
-            logger.warning(f"Could not get meeting by ID {meeting_id}: {e}")
+        meeting_service = get_meeting_service(dao)
+        original_meeting_id = meeting_id
 
-        # If not found and meeting_url provided, try to find by URL
-        if not meeting and request.meeting_url:
-            logger.info(f"Meeting not found by ID, searching by URL: {request.meeting_url}")
-            try:
-                meeting = await dao.get_meeting_by_url(request.meeting_url)
-                if meeting:
-                    logger.info(f"Found meeting by URL: {meeting.id}")
-            except Exception as e:
-                logger.warning(f"Could not get meeting by URL: {e}")
-
-        # If still not found and meeting_url provided, create a new meeting
-        if not meeting and request.meeting_url and request.platform:
-            logger.info(f"Creating new meeting for URL: {request.meeting_url}")
-            try:
-                # Determine platform enum
-                platform_map = {
-                    "google_meet": MeetingPlatform.GOOGLE_MEET,
-                    "zoom": MeetingPlatform.ZOOM,
-                    "teams": MeetingPlatform.MICROSOFT_TEAMS,
-                    "microsoft_teams": MeetingPlatform.MICROSOFT_TEAMS,
-                }
-                platform = platform_map.get(request.platform.lower(), MeetingPlatform.GOOGLE_MEET)
-                
-                # Extract meeting_id_external from URL
-                meeting_id_external = request.meeting_url.split("/")[-1].split("?")[0]
-                
-                # Create new meeting
-                meeting = Meeting(
-                    id=UUID(meeting_id) if meeting_id else uuid4(),
-                    platform=platform,
-                    meeting_url=request.meeting_url,
-                    meeting_id_external=meeting_id_external,
-                    title=f"Meeting {meeting_id[:8] if meeting_id else uuid4()}",
-                    description="Created from bot join notification",
-                    start_time=datetime.utcnow(),
-                    end_time=datetime.utcnow(),
-                    organizer_email=settings.ai_email if hasattr(settings, 'ai_email') else '',
-                    participants=[],
-                    status=MeetingStatus.SCHEDULED,
-                    ai_email=settings.ai_email if hasattr(settings, 'ai_email') else '',
-                    audio_enabled=True,
-                    video_enabled=True,
-                    recording_enabled=False
-                )
-                
-                meeting = await dao.create_meeting(meeting)
-                logger.info(f"Created new meeting: {meeting.id}")
-            except Exception as e:
-                logger.error(f"Could not create new meeting: {e}")
-
-        # Update meeting if found/created
-        if meeting:
-            # Ensure bot_joined flag is set
-            meeting.bot_joined = True
-            meeting.status = MeetingStatus.ACTIVE
-            meeting.joined_at = datetime.utcnow()
-            logger.info(
-                f"Updating meeting {meeting.id}: setting bot_joined=True, status=ACTIVE",
-                extra={
-                    "current_status": meeting.status,
-                    "has_bot_joined": meeting.bot_joined,
-                }
-            )
-            await dao.update_meeting(meeting)
-            logger.info(
-                "Meeting updated for bot join",
-                extra={
-                    "meeting_id": str(meeting.id),
-                    "session_id": request.sessionId,
-                    "platform": request.platform,
-                }
-            )
-        else:
+        # Get meeting by ID, create one if it does not exist
+        meeting = await meeting_service.get_meeting(meeting_id)
+        if not meeting:
             logger.warning(
-                "Meeting not found or created while confirming bot join",
+                "Meeting not found for bot_joined request, creating new meeting record",
                 extra={
                     "meeting_id": meeting_id,
-                    "meeting_url": request.meeting_url,
                     "session_id": request.sessionId,
                     "platform": request.platform,
-                }
+                },
             )
+
+            inferred_user_id = None
+            if request.sessionId:
+                try:
+                    inferred_user_id = UUID(request.sessionId)
+                except ValueError:
+                    logger.warning(
+                        "Failed to parse sessionId as UUID when creating fallback meeting; generating new UUID",
+                        extra={"session_id": request.sessionId},
+                    )
+            if inferred_user_id is None:
+                inferred_user_id = uuid4()
+
+            meeting = await meeting_service.create_meeting_record(
+                user_id=inferred_user_id,
+                meeting_type=request.platform or "clerk",
+                meeting_url=request.meeting_url,
+                bot_name=request.botName,
+            )
+            meeting_id = str(meeting.id)
+
+        # Update meeting status
+        meeting.bot_joined = True
+        meeting.status = MeetingStatus.ACTIVE
+        meeting.joined_at = datetime.utcnow()
+        
+        logger.info(
+            f"Updating meeting {meeting.id}: setting bot_joined=True, status=ACTIVE",
+            extra={
+                "current_status": meeting.status,
+                "has_bot_joined": meeting.bot_joined,
+            }
+        )
+        await meeting_service.update_meeting(meeting)
+        if meeting.context_id:
+            try:
+                context_service = ServiceMeetingContext(dao)
+                context_payload = await context_service.fetch_context_payload(
+                    str(meeting.context_id),
+                    str(meeting.user_id),
+                )
+                if context_payload:
+                    await context_service.cache_payload(meeting_id, context_payload)
+                    if original_meeting_id != meeting_id:
+                        await context_service.cache_payload(original_meeting_id, context_payload)
+                    logger.info(
+                        "Cached meeting context for meeting",
+                        extra={
+                            "meeting_id": meeting_id,
+                            "context_id": str(meeting.context_id),
+                        },
+                    )
+            except Exception as cache_error:
+                logger.warning(
+                    "Failed to cache meeting context",
+                    extra={
+                        "meeting_id": meeting_id,
+                        "context_id": str(meeting.context_id),
+                        "error": str(cache_error),
+                    },
+                )
+        
+        logger.info(
+            "Meeting updated for bot join",
+            extra={
+                "meeting_id": str(meeting.id),
+                "session_id": request.sessionId,
+                "platform": request.platform,
+            }
+        )
 
         return JSONResponse(
             {
                 "status": "success",
                 "message": "Bot join confirmed",
-                "meeting_id": str(meeting.id) if meeting else meeting_id,
+                "meeting_id": str(meeting.id),
                 "session_id": request.sessionId,
                 "platform": request.platform,
                 "bot_name": request.botName,
@@ -240,11 +247,116 @@ async def bot_joined(
             }
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to confirm bot joined: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to confirm bot joined: {str(e)}")
+
+
+@router.post("/{meeting_id}/bot-left")
+async def bot_left(
+    meeting_id: str,
+    request: BotLeftRequest,
+    dao: DynamoDBDAO = Depends(get_dao)
+):
+    """
+    Notify the backend that a bot has left a meeting.
+    Updates the meeting status to ENDED and marks bot_joined as False.
+    """
+    try:
+        logger.info(
+            "Bot left meeting",
+            extra={
+                "meeting_id": meeting_id,
+                "session_id": request.sessionId,
+                "reason": request.reason,
+                "timestamp": request.timestamp or datetime.utcnow().isoformat(),
+            },
+        )
+
+        meeting_service = get_meeting_service(dao)
+
+        # Try to get meeting by ID
+        meeting = None
+        try:
+            meeting = await meeting_service.get_meeting(meeting_id)
+        except Exception as e:
+            logger.warning(f"Could not get meeting by ID {meeting_id}: {e}")
+
+        # Update meeting if found
+        if meeting:
+            # Mark bot as left and update meeting status
+            meeting.bot_joined = False
+            meeting.status = MeetingStatus.ENDED
+            meeting.ended_at = datetime.utcnow()
+            
+            logger.info(
+                f"Updating meeting {meeting.id}: setting bot_joined=False, status=ENDED",
+                extra={
+                    "current_status": meeting.status,
+                    "has_bot_joined": meeting.bot_joined,
+                    "reason": request.reason,
+                }
+            )
+            await meeting_service.update_meeting(meeting)
+            logger.info(
+                "Meeting updated for bot leave",
+                extra={
+                    "meeting_id": str(meeting.id),
+                    "session_id": request.sessionId,
+                    "reason": request.reason,
+                }
+            )
+
+            if meeting.context_id:
+                try:
+                    context_service = ServiceMeetingContext(dao)
+                    await context_service.clear_cached_payload(meeting_id)
+                    logger.info(
+                        "Cleared cached meeting context",
+                        extra={
+                            "meeting_id": meeting_id,
+                            "context_id": str(meeting.context_id),
+                        },
+                    )
+                except Exception as cache_error:
+                    logger.warning(
+                        "Failed to clear cached meeting context",
+                        extra={
+                            "meeting_id": meeting_id,
+                            "context_id": str(meeting.context_id),
+                            "error": str(cache_error),
+                        },
+                    )
+        else:
+            logger.warning(
+                "Meeting not found while confirming bot left",
+                extra={
+                    "meeting_id": meeting_id,
+                    "session_id": request.sessionId,
+                    "reason": request.reason,
+                }
+            )
+
+        return JSONResponse(
+            {
+                "status": "success",
+                "message": "Bot leave confirmed",
+                "meeting_id": str(meeting.id) if meeting else meeting_id,
+                "session_id": request.sessionId,
+                "reason": request.reason,
+                "timestamp": request.timestamp or datetime.utcnow().isoformat(),
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to confirm bot left: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to confirm bot left: {str(e)}")
 
 
 @router.post("/generate-url", response_model=GenerateMeetingUrlResponse)
@@ -266,11 +378,8 @@ async def generate_meeting_url(request: GenerateMeetingUrlRequest) -> GenerateMe
 
         # Delegate URL generation per platform
         if plat == "clerk":
-            # Match existing pattern used elsewhere in the app
-            base_frontend = "http://localhost:3000"
-            if settings.api_base_url:
-                base_frontend = settings.api_base_url.replace('/api/v1', '').replace(':8000', ':3000')
-            url = f"{base_frontend}/standalone-call?meetingId={mid}"
+            base_frontend = settings.frontend_base_url or "http://localhost:3000"
+            url = f"{base_frontend.rstrip('/')}/standalone-call?meetingId={mid}"
             return GenerateMeetingUrlResponse(platform=plat, meeting_id=mid, meeting_url=url)
 
         if plat == "teams":
@@ -378,7 +487,8 @@ async def get_active_meetings(
     try:
         # Query DynamoDB for meetings filtered by user_id and filter for active ones
         user_id = current_user["user_id"]
-        meetings = await dao.get_meetings(limit=100, user_id=user_id)
+        meeting_service = get_meeting_service(dao)
+        meetings = await meeting_service.get_meetings(limit=100, user_id=user_id)
         active_meetings = [m for m in meetings if m.status == MeetingStatus.ACTIVE]
         
         return active_meetings
@@ -442,7 +552,7 @@ async def bulk_delete_meetings(
         for meeting_id in meeting_ids:
             try:
                 # Verify ownership before deletion
-                meeting = await dao.get_meeting(meeting_id)
+                meeting = await get_meeting_service(dao).get_meeting(meeting_id)
                 if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
                     failed_deletions.append({
                         "meeting_id": meeting_id,
@@ -450,7 +560,8 @@ async def bulk_delete_meetings(
                     })
                     continue
                 
-                await dao.delete_meeting(meeting_id)
+                meeting_service = get_meeting_service(dao)
+                await meeting_service.delete_meeting(meeting_id)
                 deleted_count += 1
                 logger.info(f"Deleted meeting: {meeting_id}")
             except Exception as e:
@@ -480,8 +591,9 @@ async def get_meeting(
 ):
     """Get a specific meeting by ID. Only accessible by the owner."""
     try:
+        meeting_service = get_meeting_service(dao)
         # Query DynamoDB for the meeting
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await meeting_service.get_meeting(str(meeting_id))
         
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
@@ -505,8 +617,9 @@ async def get_meeting_summary(
 ):
     """Get meeting summary by meeting ID. Only accessible by the owner."""
     try:
+        meeting_service = get_meeting_service(dao)
         # Verify ownership
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await meeting_service.get_meeting(str(meeting_id))
         if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
         # In a real implementation, you would query DynamoDB for the summary
@@ -555,8 +668,10 @@ async def join_meeting(
     Transcription and summarization continue in background.
     """
     try:
+        meeting_service = get_meeting_service(dao)
+
         # Get meeting from database
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await meeting_service.get_meeting(str(meeting_id))
         
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
@@ -576,7 +691,7 @@ async def join_meeting(
         meeting.status = MeetingStatus.JOINING
         meeting.join_attempts += 1
         meeting.last_join_attempt = datetime.utcnow()
-        await dao.update_meeting(meeting)
+        await meeting_service.update_meeting(meeting)
         
         # Send Recall bot to meeting
         logger.info(f"🔗 Sending Recall bot to meeting: {meeting.meeting_url}")
@@ -604,7 +719,7 @@ async def join_meeting(
             # Update to ACTIVE
             meeting.status = MeetingStatus.ACTIVE
             meeting.joined_at = datetime.utcnow()
-            await dao.update_meeting(meeting)
+            await meeting_service.update_meeting(meeting)
             
             logger.info(f"✅ Recall bot successfully sent to meeting: {meeting.title}")
             logger.info(f"🤖 Bot ID: {join_response.metadata.get('recall_bot_id')}")
@@ -621,7 +736,7 @@ async def join_meeting(
             # Join failed
             meeting.status = MeetingStatus.FAILED
             meeting.error_message = join_response.error_message
-            await dao.update_meeting(meeting)
+            await get_meeting_service(dao).update_meeting(meeting)
             
             logger.error(f"❌ Failed to join: {join_response.error_message}")
             
@@ -672,7 +787,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
                 elif status == "fatal":
                     logger.error(f"❌ Recall bot encountered fatal error")
                     meeting.status = MeetingStatus.FAILED
-                    await dao.update_meeting(meeting)
+                    await get_meeting_service(dao).update_meeting(meeting)
                     return
             
             if not bot_joined:
@@ -699,7 +814,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
                     # Update meeting status to ENDED
                     meeting.status = MeetingStatus.ENDED
                     meeting.ended_at = datetime.utcnow()
-                    await dao.update_meeting(meeting)
+                    await get_meeting_service(dao).update_meeting(meeting)
                     logger.info(f"✅ Meeting status updated to ENDED")
         
         # Get transcript from Recall
@@ -713,7 +828,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
                 if full_transcription:
                     meeting.full_transcription = full_transcription.strip()
                     meeting.transcription_chunks.append(full_transcription)
-                    await dao.update_meeting(meeting)
+                    await get_meeting_service(dao).update_meeting(meeting)
                     logger.info(f"💾 Saved Recall transcript: {len(full_transcription)} chars")
                     logger.info(f"📝 Transcript preview: {full_transcription[:200]}...")
                     
@@ -738,7 +853,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
                         if summary:
                             # Store the summary object directly (it's already a MeetingSummary)
                             meeting.summary = summary
-                            await dao.update_meeting(meeting)
+                            await get_meeting_service(dao).update_meeting(meeting)
                             logger.info(f"✅ Saved summary with {len(summary.action_items)} action items")
                     else:
                         logger.warning(f"⚠️ Transcript too short for summarization ({len(full_transcription)} chars)")
@@ -775,7 +890,7 @@ async def leave_meeting(
         logger.info(f"🚪 Leave meeting request received for: {meeting_id}")
         
         # Get meeting from database
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         logger.info(f"📋 Retrieved meeting: {meeting.title if meeting else 'None'}")
         
         if not meeting:
@@ -803,7 +918,7 @@ async def leave_meeting(
         # Update meeting status to ENDED
         meeting.status = MeetingStatus.ENDED
         meeting.ended_at = datetime.utcnow()
-        await dao.update_meeting(meeting)
+        await get_meeting_service(dao).update_meeting(meeting)
         
         logger.info(f"✅ Bot left meeting: {meeting.title}")
         
@@ -836,7 +951,7 @@ async def send_meeting_notification(
     """Send notification for a meeting. Only accessible by the owner."""
     try:
         # Get meeting and verify ownership
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
         if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
@@ -878,19 +993,46 @@ async def get_meeting_participants(
 ):
     """Get list of meeting participants. Only accessible by the owner."""
     try:
-        # Get meeting and verify ownership
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting_service = get_meeting_service(dao)
+        meeting = await meeting_service.get_meeting(str(meeting_id))
+
         if not meeting:
-            raise HTTPException(status_code=404, detail="Meeting not found")
+            logger.warning(
+                "Meeting not found while fetching participants. Creating new meeting.",
+                extra={
+                    "requested_meeting_id": str(meeting_id),
+                    "user_id": current_user["user_id"],
+                },
+            )
+
+            default_context = await meeting_service.context_service.fetch_default_context(
+                current_user["user_id"]
+            )
+            meeting = await meeting_service.create_meeting_record(
+                user_id=UUID(current_user["user_id"]),
+                meeting_type="clerk",
+                context_id=str(default_context.id) if default_context else None,
+                voice_id=default_context.voice_id if default_context else None,
+                bot_name=default_context.name if default_context else None,
+            )
+
+            return {
+                "meeting_id": str(meeting.id),
+                "participants": meeting.participants,
+                "total_count": len(meeting.participants),
+                "created": True,
+            }
+
         if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
-        
+
         return {
-            "meeting_id": meeting_id,
+            "meeting_id": str(meeting.id),
             "participants": meeting.participants,
-            "total_count": len(meeting.participants)
+            "total_count": len(meeting.participants),
+            "created": False,
         }
-        
+
     except Exception as e:
         logger.error(f"Error getting participants for meeting {meeting_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve participants")
@@ -905,7 +1047,7 @@ async def get_meeting_transcription(
     """Get meeting transcription. Only accessible by the owner."""
     try:
         # Get meeting and verify ownership
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
         if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
@@ -932,7 +1074,7 @@ async def get_meeting_action_items(
     """Get action items for a meeting. Only accessible by the owner."""
     try:
         # Verify ownership first
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting not found")
         if meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
@@ -960,7 +1102,7 @@ async def update_action_item(
     """Update action item status. Only accessible by the owner."""
     try:
         # Verify ownership
-        meeting = await dao.get_meeting(str(meeting_id))
+        meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
         # In a real implementation, you would update the action item in DynamoDB
@@ -1322,14 +1464,14 @@ async def join_meeting_as_participant(
         
         # Store participant in database and update meeting
         try:
-            await dao.add_meeting_participant(meeting_id, participant)
+            await get_meeting_service(dao).add_meeting_participant(meeting_id, participant)
         except Exception as e:
             logger.warning(f"Failed to store participant in database: {e}")
         
         # Send WebSocket notification to other participants
         try:
             # Broadcast participant joined event to all connected clients
-            from services.rt_gateway.app import broadcast_to_conversation
+            from services.rt_gateway.services import broadcast_to_conversation
             
             # Map meeting_id to conversation_id (for now, we'll use meeting_id as conversation_id)
             conversation_id = meeting_id.replace('meeting-', '')
@@ -1381,14 +1523,14 @@ async def leave_meeting_as_participant(
         
         # Remove participant from database
         try:
-            await dao.remove_meeting_participant(meeting_id, participant_id)
+            await get_meeting_service(dao).remove_meeting_participant(meeting_id, participant_id)
         except Exception as e:
             logger.warning(f"Failed to remove participant from database: {e}")
         
         # Send WebSocket notification to other participants
         try:
             # Broadcast participant left event to all connected clients
-            from services.rt_gateway.app import broadcast_to_conversation
+            from services.rt_gateway.services import broadcast_to_conversation
             
             # Map meeting_id to conversation_id (for now, we'll use meeting_id as conversation_id)
             conversation_id = meeting_id.replace('meeting-', '')
@@ -1430,7 +1572,7 @@ async def get_meeting_participants(
     """
     try:
         # Query database for participants
-        participants = await dao.get_meeting_participants(meeting_id)
+        participants = await get_meeting_service(dao).get_meeting_participants(meeting_id)
         
         return {
             "meeting_id": meeting_id,
