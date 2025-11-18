@@ -68,7 +68,6 @@ class Settings(BaseSettings):
 
     # AI Services
     openai_api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
-    anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
     elevenlabs_api_key: Optional[str] = Field(None, env="ELEVENLABS_API_KEY")
     deepgram_api_key: Optional[str] = Field(None, env="DEEPGRAM_API_KEY")
 
@@ -135,7 +134,6 @@ class Settings(BaseSettings):
 
     # AI Services
     openai_api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
-    anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
     elevenlabs_api_key: Optional[str] = Field(None, env="ELEVENLABS_API_KEY")
     deepgram_api_key: Optional[str] = Field(None, env="DEEPGRAM_API_KEY")
     aurray_api_key: Optional[str] = Field(None, env="AURRAY_API_KEY")
