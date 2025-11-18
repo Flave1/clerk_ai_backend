@@ -1038,8 +1038,8 @@ class MicrosoftTeamsClient:
     async def _save_meeting_to_db(self, meeting) -> bool:
         """Save meeting to database."""
         try:
-            from services.api.dao import DynamoDBDAO
-            dao = DynamoDBDAO()
+            from services.api.dao import MongoDBDAO
+            dao = MongoDBDAO()
             await dao.initialize()
             await dao.create_meeting(meeting)
             logger.info(f"Successfully saved meeting {meeting.id} to database")

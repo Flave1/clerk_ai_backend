@@ -336,7 +336,11 @@ class ExternalTurnManager:
             # Build context
             context = await self._build_context(session_id)
             
-            # Get LLM response
+            # Get LLM response (if available)
+            if not self.llm_service:
+                logger.warning("LLM service not available - cannot generate response")
+                return None
+            
             logger.info(f"🤖 Generating LLM response for session {session_id}")
             full_response = ""
             async for llm_chunk in self.llm_service.generate_response_streaming(

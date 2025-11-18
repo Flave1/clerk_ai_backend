@@ -1,5 +1,5 @@
 """
-Newsletter/Waiting List API routes backed by DynamoDB.
+Newsletter/Waiting List API routes backed by MongoDB.
 """
 import logging
 from datetime import timezone, datetime
@@ -7,9 +7,9 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
-from botocore.exceptions import ClientError
+from pymongo.errors import PyMongoError
 
-from services.api.dao import DynamoDBDAO, get_dao
+from services.api.dao import MongoDBDAO, get_dao
 from shared.schemas import NewsletterSubscription
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ class NewsletterSignupResponse(BaseModel):
 @router.post("/", response_model=NewsletterSignupResponse, status_code=status.HTTP_201_CREATED)
 async def signup_newsletter(
     request: NewsletterSignupRequest,
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Add a user to the waiting list/newsletter.
@@ -79,14 +79,7 @@ async def signup_newsletter(
     
     except HTTPException:
         raise
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        if error_code == "ResourceNotFoundException":
-            logger.error(f"Newsletter table does not exist: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Newsletter service is not configured. Please create the newsletter table in DynamoDB.",
-            )
+    except PyMongoError as e:
         logger.error(f"Failed to add to waiting list: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -101,7 +94,7 @@ async def signup_newsletter(
 
 
 @router.get("/", status_code=status.HTTP_200_OK)
-async def get_waiting_list(dao: DynamoDBDAO = Depends(get_dao)):
+async def get_waiting_list(dao: MongoDBDAO = Depends(get_dao)):
     """
     Get all waiting list entries.
     
@@ -123,14 +116,7 @@ async def get_waiting_list(dao: DynamoDBDAO = Depends(get_dao)):
                 for signup in waiting_list
             ],
         }
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        if error_code == "ResourceNotFoundException":
-            logger.error(f"Newsletter table does not exist: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Newsletter service is not configured. Please create the newsletter table in DynamoDB.",
-            )
+    except PyMongoError as e:
         logger.error(f"Failed to get waiting list: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install build dependencies needed for compiling C extensions (like hiredis)
+# Install build dependencies needed for compiling C extensions
 # Then install Python packages and remove build tools in the same layer to reduce image size
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only the requirements first (for better layer caching)
-COPY requirements.txt .
+# Use production requirements to reduce image size (excludes dev/test dependencies)
+COPY requirements-prod.txt ./requirements.txt
 
 # Install dependencies and remove build tools in the same RUN command to reduce layers
 RUN pip install --no-cache-dir --upgrade pip && \
@@ -18,7 +19,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     apt-get purge -y build-essential gcc && \
     apt-get autoremove -y && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache/pip
 
 # Copy only necessary application code (excludes files in .dockerignore)
 COPY . .

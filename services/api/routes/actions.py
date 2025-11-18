@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from shared.schemas import Action, ActionStatus, ActionType
 
 from ..auth import get_current_user
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ async def get_actions(
     limit: int = Query(50, le=100),
     offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get list of actions for the authenticated user."""
     try:
@@ -87,7 +87,7 @@ async def get_actions(
 async def get_action(
     action_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get a specific action."""
     try:
@@ -121,7 +121,7 @@ async def update_action(
     action_id: str,
     update: ActionUpdate,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Update an action."""
     try:

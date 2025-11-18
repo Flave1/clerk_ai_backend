@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from shared.schemas import ApiKey, ApiKeyStatus
 
 from ..auth import get_current_user, hash_password
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def generate_api_key() -> str:
 async def create_api_key(
     request: ApiKeyCreateRequest,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Create a new API key for the authenticated user."""
     try:
@@ -122,7 +122,7 @@ async def create_api_key(
 @router.get("/", response_model=List[ApiKeyResponse])
 async def list_api_keys(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get all API keys for the authenticated user."""
     try:
@@ -154,7 +154,7 @@ async def list_api_keys(
 async def get_api_key(
     api_key_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get a specific API key. Only accessible by the owner."""
     try:
@@ -192,7 +192,7 @@ async def update_api_key(
     api_key_id: str,
     request: ApiKeyUpdateRequest,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Update an API key. Only accessible by the owner."""
     try:
@@ -241,7 +241,7 @@ async def update_api_key(
 async def delete_api_key(
     api_key_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Delete (revoke) an API key. Only accessible by the owner."""
     try:

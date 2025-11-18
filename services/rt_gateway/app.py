@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config import get_settings
 
-from .routes import bot, conversations, llm, stt, tts
+from .routes import bot, conversations, stt, tts  # llm removed
 from .services import (
     active_bot_sessions,
     active_conversations,
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     # Import here to avoid circular imports
     from .events import EventPublisher
     from .external_turn_manager import ExternalTurnManager
-    from .llm import LLMService
+    # from .llm import LLMService  # REMOVED: LLM service removed
     from .stt import STTService
     from .tts import TTSService
     from .turn_manager import TurnManager
@@ -67,14 +67,16 @@ async def lifespan(app: FastAPI):
         tts_service = TTSService()
         rt_services.tts_service = tts_service
         
-        llm_service = LLMService()
-        rt_services.llm_service = llm_service
+        # llm_service = LLMService()  # REMOVED: LLM service removed
+        # rt_services.llm_service = llm_service  # REMOVED: LLM service removed
         
-        turn_manager = TurnManager(llm_service, event_publisher, tts_service)
+        # TurnManager can work without llm_service (it will use None)
+        turn_manager = TurnManager(None, event_publisher, tts_service)
         rt_services.turn_manager = turn_manager
 
         if settings.use_external_turn_manager:
-            external_turn_manager = ExternalTurnManager(llm_service)
+            # ExternalTurnManager can work without llm_service (it will use None)
+            external_turn_manager = ExternalTurnManager(None)
             await external_turn_manager.initialize()
             rt_services.external_turn_manager = external_turn_manager
             logger.info("✅ External turn manager initialized")
@@ -141,11 +143,11 @@ app.include_router(
     tags=["tts"],
 )
 
-app.include_router(
-    llm.router,
-    prefix="/llm",
-    tags=["llm"],
-)
+# app.include_router(
+#     llm.router,
+#     prefix="/llm",
+#     tags=["llm"],
+# )  # REMOVED: LLM service removed
 
 app.include_router(
     bot.ws_router,

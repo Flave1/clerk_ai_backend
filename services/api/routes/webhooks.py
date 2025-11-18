@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Header
 from pydantic import BaseModel
 
 from shared.schemas import JoinMeetingRequest, MeetingStatus, MeetingContext
-from services.api.dao import get_dao, DynamoDBDAO
+from services.api.dao import get_dao, MongoDBDAO
 from shared.config import get_settings
 from services.meeting_agent.bot_orchestrator import get_bot_orchestrator
 from services.api.service_meeting import ServiceMeeting
@@ -136,7 +136,7 @@ async def _launch_bot_subprocess_fallback(
 
 async def get_user_from_api_key(
     authorization: Optional[str] = Header(None, alias="Authorization"),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ) -> dict:
     """
     Authenticate using API key only (public endpoint secured by API key).
@@ -208,7 +208,7 @@ async def get_user_from_api_key(
 async def join_meeting(
     request: JoinMeetingRequest,
     current_user: dict = Depends(get_user_from_api_key),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Join meeting webhook endpoint (public, secured by API key only).
@@ -368,7 +368,7 @@ async def get_voice_profiles(
 @router.get("/meeting_contexts")
 async def get_meeting_contexts_webhook(
     current_user: dict = Depends(get_user_from_api_key),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Get meeting contexts webhook endpoint (public, secured by API key only).

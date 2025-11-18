@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from shared.config import get_settings
 
-from .dao import DynamoDBDAO, set_dao_instance
+from .dao import MongoDBDAO, set_dao_instance
 from services.api.routes import actions, auth, rooms, meetings, api_keys, webhooks, integrations, meeting_contexts, newsletter
 from services.api.ws import ConnectionManager
 
@@ -24,7 +24,7 @@ settings = get_settings()
 
 # Global services
 connection_manager = ConnectionManager()
-dao = DynamoDBDAO()
+dao = MongoDBDAO()
 
 
 @asynccontextmanager

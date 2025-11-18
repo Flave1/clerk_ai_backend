@@ -12,7 +12,7 @@ from shared.schemas import (Action, ActionStatus, ActionType, Conversation,
                             ConversationStatus, Turn, TurnType)
 
 if TYPE_CHECKING:
-    from services.api.dao import DynamoDBDAO
+    from services.api.dao import MongoDBDAO
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -55,6 +55,7 @@ class TurnManager:
 
     async def start_conversation(
         self,
+        meeting_id: str,
         room_id: str,
         user_id: str,
         metadata: Optional[Dict[str, Any]] = None,
@@ -70,6 +71,7 @@ class TurnManager:
                 user_uuid = uuid4()
                 logger.info(f"Generated new UUID for user_id: {user_uuid}")
             conversation = Conversation(
+                id=meeting_id,
                 user_id=user_uuid,
                 room_id=room_id,
                 status=ConversationStatus.ACTIVE,
@@ -234,7 +236,11 @@ class TurnManager:
 
             meeting_id = conversation.metadata.get("meeting_id") if conversation.metadata else None
 
-            # Process through LLM
+            # Process through LLM (if available)
+            if not self.llm_service:
+                logger.warning("LLM service not available - skipping turn processing")
+                return None
+
             response = await self.llm_service.process_turn(
                 turn,
                 context,
@@ -287,7 +293,11 @@ class TurnManager:
 
             meeting_id = conversation.metadata.get("meeting_id") if conversation.metadata else None
 
-            # Process through LLM
+            # Process through LLM (if available)
+            if not self.llm_service:
+                logger.warning("LLM service not available - skipping turn processing")
+                return None
+
             response = await self.llm_service.process_turn(
                 turn,
                 context,

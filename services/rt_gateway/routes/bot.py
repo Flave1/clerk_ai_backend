@@ -1,347 +1,380 @@
 """
-Bot WebSocket routes using OpenAI Realtime API.
-
-This replaces the traditional STT → LLM → TTS pipeline with OpenAI's Realtime API
-for unified speech-to-speech processing with near-zero latency.
+Aurray Voice Backend — ChatGPT Voice Mode Compatible
+Author: Fully Repaired Version
 """
+
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any
-
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-
+import struct
+import time
 import base64
-from shared.config import get_settings
-from .. import services as rt_services
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
 from ..realtime_api import RealtimeAPIService
+from .. import services as rt_services
 
 logger = logging.getLogger(__name__)
+
+# HTTP router (empty - bot only uses WebSocket routes)
 router = APIRouter()
-ws_router = APIRouter()  # Separate router for WebSocket routes
-settings = get_settings()
 
-# Store active Realtime API sessions per session_id
-active_realtime_sessions: Dict[str, RealtimeAPIService] = {}
+# WebSocket router
+ws_router = APIRouter()
 
+# Active Realtime API sessions
+active_realtime_sessions = {}
 
-class BotSpeakRequest(BaseModel):
-    """Request model for bot speak endpoint."""
-    text: str
-    voice_id: str = "default"
-    model: str = "openai"
+# --- Utility: RMS ----------------------------------------------------------
 
-
-async def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Handle tool calls from Realtime API.
+def calculate_audio_rms(audio_bytes: bytes) -> float:
+    """Return normalized RMS for PCM16 audio."""
+    if len(audio_bytes) < 2:
+        return 0.0
     
-    Args:
-        tool_name: Name of the tool to execute
-        arguments: Tool arguments
+    samples = struct.unpack(f"<{len(audio_bytes)//2}h", audio_bytes)
+    sum_sq = sum(s * s for s in samples)
+    rms = (sum_sq / len(samples)) ** 0.5
     
-    Returns:
-        Tool execution result
-    """
-    if tool_name == "saveNote":
-        note_text = arguments.get("text", "")
-        # TODO: Integrate with your note storage system
-        return {"status": "ok", "message": "Note saved successfully"}
+    return min(rms / 32768.0, 1.0)
     
-    elif tool_name == "createTask":
-        task = arguments.get("task", "")
-        assignee = arguments.get("assignee")
-        # TODO: Integrate with your task management system
-        return {"status": "ok", "message": "Task created successfully"}
-    
-    elif tool_name == "summarizeDiscussion":
-        topic = arguments.get("topic", "")
-        # TODO: Generate and return summary
-        return {"status": "ok", "summary": f"Summary of {topic}"}
-    
-    else:
-        return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
+# ======================================================================
+# ==  MAIN WEBSOCKET HANDLER  ==========================================
+# ======================================================================
 
 @ws_router.websocket("/bot/{session_id}")
 async def bot_websocket(websocket: WebSocket, session_id: str):
     """
-    Unified WebSocket endpoint for bot audio streaming.
-    
-    Handles BOTH input and output on a single connection:
-    - Receives audio chunks (bytes) → forwards to Realtime API
-    - Receives control messages (text) → handles registration, commits, etc.
-    - Sends audio output (bytes) from Realtime API
-    - Sends text messages (transcription, ai_response, etc.)
+    FULL ChatGPT Voice Mode clone:
+    - Single unified WebSocket
+    - Audio streamed as raw PCM16 (Float32 → Int16 → bytes)
+    - Automatic turn-taking
+    - Automatic commit based on server VAD OR fallback backend VAD
+    - Interrupt handled instantly
+    - No premature commits
     """
     await websocket.accept()
     
-    # Store WebSocket for Realtime API to send audio to
+    # Store frontend WebSocket
     rt_services.active_bot_sessions[session_id] = websocket
-    rt_services.bot_session_metadata[session_id] = rt_services.bot_session_metadata.get(session_id, {})
+    # Only initialize if not already set (don't overwrite existing meeting_context from conversations.py)
+    if session_id not in rt_services.bot_session_metadata:
+        rt_services.bot_session_metadata[session_id] = {}
+
     
-    # Track transcript for sending to frontend
-    current_transcript = ""
-    current_ai_response = ""
+    # ChatGPT-like state
+    buffer_started_at = None
+    last_voice_ts = None
+    voice_detected = False
+    RMS_THRESHOLD = 0.005
+    MIN_MS = 100
+    GRACE_MS = 300
     
     try:
-        # Wait for registration message from frontend
-        registration_received = False
-        while not registration_received:
-            try:
-                data = await asyncio.wait_for(websocket.receive(), timeout=5.0)
-                
-                if "text" in data:
-                    message = json.loads(data["text"])
-                    # Support both old and new registration formats
-                    msg_type = message.get("type")
-                    if msg_type == "bot_registration" or msg_type == "register":
-                        # Store registration info
-                        rt_services.bot_session_metadata[session_id].update({
-                            "meeting_id": message.get("meetingId") or message.get("meeting_id") or session_id,
-                            "bot_name": message.get("botName") or message.get("bot_name") or "Aurray",
-                            "platform": message.get("platform", "clerk"),
-                            "audio_config": message.get("audioConfig") or message.get("audio_config") or {},
-                            "participants": message.get("participants", []),
-                            "topic": message.get("topic", "General meeting")
-                        })
-                        registration_received = True
-                        
-                        # NEW: Send connected message for new format
-                        if msg_type == "register":
-                            try:
-                                await websocket.send_text(json.dumps({
-                                    "type": "connected",
-                                    "session_id": session_id
-                                }))
-                            except Exception as e:
-                                pass
-            except asyncio.TimeoutError:
-                registration_received = True
+        # ==================================================================
+        # STEP 1 — WAIT FOR REGISTER MESSAGE
+        # ==================================================================
+        logger.info(f"[AURRAY] Waiting for registration message from {session_id}")
+        while True:
+            msg = await websocket.receive()
+            logger.info(f"[AURRAY] Registration loop: received data with keys={list(msg.keys())}")
+
+            if "text" in msg:
+                try:
+                    body = json.loads(msg["text"])
+                    logger.info(f"[AURRAY] Registration loop: parsed JSON, type={body.get('type')}")
+                    # Ensure body is a dictionary
+                    if not isinstance(body, dict):
+                        logger.warning(f"Expected dict in registration, got {type(body).__name__}: {body}")
+                        continue
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"Failed to parse registration JSON: {e}, data: {msg.get('text', '')[:100]}")
+                    continue
+                    
+                if body.get("type") in ("register", "bot_registration"):
+                    logger.info(f"[AURRAY] ✅ Registration received for {session_id}, sending connected response")
+                    await websocket.send_text(json.dumps({
+                        "type": "connected",
+                        "session_id": session_id
+                    }))
+                    logger.info(f"[AURRAY] ✅ Connected response sent for {session_id}")
+                    break
+            else:
+                logger.warning(f"[AURRAY] Registration loop: received non-text data: {list(msg.keys())}")
+
+        # ==================================================================
+        # STEP 2 — INIT REALTIME SESSION
+        # ==================================================================
+        logger.info(f"[AURRAY] Checking for existing Realtime session for {session_id}")
+        rt_session = active_realtime_sessions.get(session_id)
         
-        # Initialize or reuse Realtime API service
-        # Check if session already exists (from previous connection)
-        realtime_service = active_realtime_sessions.get(session_id)
-        
-        if not realtime_service:
-            # No existing session - create new one
-            await _initialize_realtime_session(session_id, websocket, [current_transcript], [current_ai_response])
-            realtime_service = active_realtime_sessions.get(session_id)
-        
-        if not realtime_service:
-            logger.error(f"Failed to initialize Realtime API for session {session_id}")
-            await websocket.close(code=1008, reason="Failed to initialize Realtime API")
-            return
-        
-        # Main message loop - handles both input and output
+        if not rt_session:
+            logger.info(f"[AURRAY] Initializing new Realtime session for {session_id}")
+            await _init_rt_session(session_id)
+            rt_session = active_realtime_sessions.get(session_id)
+            
+            if not rt_session:
+                logger.error(f"[AURRAY] ❌ Failed to initialize Realtime session for {session_id}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Failed to initialize Realtime API session"
+                }))
+                return
+            else:
+                logger.info(f"[AURRAY] ✅ Realtime session initialized successfully for {session_id}")
+        else:
+            logger.info(f"[AURRAY] ✅ Using existing Realtime session for {session_id}")
+
+        logger.info(f"[AURRAY] Realtime session ready for {session_id}")
+
+        # ==================================================================
+        # STEP 3 — MAIN LOOP
+        # ==================================================================
+        logger.info(f"[AURRAY] Starting main loop for {session_id}")
+        chunk_count = 0
+        text_count = 0
         while True:
             try:
                 data = await websocket.receive()
+            except WebSocketDisconnect:
+                logger.info(f"[AURRAY] WebSocket disconnected for {session_id}")
+                break
+            except Exception as e:
+                logger.error(f"[AURRAY] WS receive error: {e}", exc_info=True)
+                break
+            
+            # Log received data structure (first 50 chunks, then every 50th)
+            chunk_count += 1
+            if chunk_count <= 50 or chunk_count % 50 == 0:
+                logger.info(f"[AURRAY] 📦 Received data #{chunk_count}: keys={list(data.keys())}, has_bytes={'bytes' in data}, has_text={'text' in data}, data_type={type(data)}")
+                if "bytes" not in data and "text" not in data:
+                    logger.warning(f"[AURRAY] ⚠️ Unexpected data format: {data}")
                 
-                if 'type' in data and data.get('type') == 'websocket.disconnect':
+            # -------------------------------------------------------------
+            # A) AUDIO CHUNK
+            # -------------------------------------------------------------
+            # FastAPI WebSocket: binary data comes as {"bytes": b"..."}
+            # Also check for direct bytes or other formats
+            if "bytes" in data:
+                chunk = data["bytes"]
+                rms = calculate_audio_rms(chunk)
+                
+                if chunk_count <= 50 or chunk_count % 50 == 0:
+                    logger.info(f"[AURRAY] 📥 Audio chunk #{chunk_count}: {len(chunk)} bytes, RMS: {rms:.4f}, voice_detected={voice_detected}, buffer_started={buffer_started_at is not None}")
+
+                now = time.time()
+
+                # First chunk starts buffer
+                if buffer_started_at is None:
+                    buffer_started_at = now
+
+                # Detect actual voice
+                if rms > RMS_THRESHOLD:
+                    voice_detected = True
+                    last_voice_ts = now
+
+                # Check if response is in progress - if so, only forward if user voice detected (for interruption)
+                is_response_in_progress = await rt_session.is_response_in_progress()
+                should_forward = not is_response_in_progress or (rms > RMS_THRESHOLD)
+                
+                if not should_forward:
+                    # Skip forwarding audio when bot is responding and no user voice detected
+                    # This prevents bot's own voice from being sent back (feedback loop)
+                    if chunk_count <= 10 or chunk_count % 50 == 0:
+                        logger.info(f"[AURRAY] ⏭️ Skipping audio chunk #{chunk_count}: response in progress and no user voice detected")
+                    continue
+
+                # Forward audio to OpenAI
+                try:
+                    if chunk_count <= 10 or chunk_count % 50 == 0:
+                        logger.info(f"[AURRAY] 🔄 Forwarding audio chunk #{chunk_count} to OpenAI Realtime API (response_in_progress={is_response_in_progress}, user_voice={rms > RMS_THRESHOLD})")
+                    await rt_session._send_message({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode()
+                    })
+                    if chunk_count <= 10 or chunk_count % 50 == 0:
+                        logger.info(f"[AURRAY] ✅ Successfully forwarded audio chunk #{chunk_count} to OpenAI")
+                except Exception as e:
+                    logger.error(f"[AURRAY] ❌ Failed to forward audio chunk #{chunk_count}: {e}", exc_info=True)
+                    break
+                            
+                continue
+
+            # -------------------------------------------------------------
+            # B) TEXT MESSAGE
+            # -------------------------------------------------------------
+            if "text" in data:
+                text_count += 1
+                if text_count <= 10 or text_count % 10 == 0:
+                    logger.info(f"[AURRAY] 📨 Text message #{text_count} (chunk #{chunk_count}): {data.get('text', '')[:200]}")
+                try:
+                    msg = json.loads(data["text"])
+                    # Ensure msg is a dictionary
+                    if not isinstance(msg, dict):
+                        logger.warning(f"[AURRAY] Expected dict, got {type(msg).__name__}: {msg}")
+                        continue
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"[AURRAY] Failed to parse message JSON: {e}, data: {data.get('text', '')[:200]}")
+                    continue
+                
+                t = msg.get("type")
+                logger.info(f"[AURRAY] 📨 Parsed message type: {t}")
+
+                # Ping/pong
+                if t == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+
+                # User interrupts bot
+                if t in ("interrupt", "response.cancel"):
+                    await rt_session._send_message({"type": "response.cancel"})
+                    buffer_started_at = None
+                    voice_detected = False
+                    last_voice_ts = None
+                    continue
+
+                # MANUAL COMMIT
+                if t in ("commit", "input_audio_buffer.commit"):
+                    now = time.time()
+                    logger.info(f"[AURRAY] 🔄 Processing commit request: voice_detected={voice_detected}, buffer_started={buffer_started_at is not None}, last_voice_ts={last_voice_ts}")
+
+                    # No voice detected → ignore
+                    if not voice_detected:
+                        logger.info(f"[AURRAY] ⏭️ Commit skipped: no voice detected")
+                        buffer_started_at = None
+                        continue
+
+                    # Too short
+                    if buffer_started_at:
+                        dur_ms = (now - buffer_started_at) * 1000
+                        if dur_ms < MIN_MS:
+                            logger.info(f"[AURRAY] ⏭️ Commit skipped: buffer too short ({dur_ms:.1f}ms < {MIN_MS}ms)")
+                            continue
+                            
+                    # Grace window
+                    if last_voice_ts:
+                        since_last = (now - last_voice_ts) * 1000
+                        if since_last < GRACE_MS:
+                            logger.info(f"[AURRAY] ⏭️ Commit skipped: grace period not met ({since_last:.1f}ms < {GRACE_MS}ms)")
+                            continue
+                            
+                    # COMMIT
+                    logger.info(f"[AURRAY] ✅ Commit conditions met, calling _safe_commit")
+                    await _safe_commit(rt_session, websocket, session_id)
+                    logger.info(f"[AURRAY] ✅ Commit completed successfully")
+
+                    buffer_started_at = None
+                    voice_detected = False
+                    last_voice_ts = None
+                    continue
+
+                if t == "end_stream":
                     break
                 
-                if 'bytes' in data:
-                    # Raw PCM16 audio input chunk (16kHz or 24kHz) - base64 encode and forward to OpenAI
-                    audio_chunk = data['bytes']
-                    
-                    if not realtime_service:
-                        continue
-                    
-                    try:
-                        # Base64 encode the raw PCM bytes
-                        audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
-                        
-                        # Send to OpenAI Realtime API as input_audio_buffer.append
-                        await realtime_service._send_message({
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_base64
-                        })
-                    except Exception as e:
-                        logger.error(f"Failed to send audio chunk to Realtime API: {e}", exc_info=True)
-                        # Connection is likely closed, break the loop
-                        break
-                            
-                elif 'text' in data:
-                    try:
-                        message = json.loads(data["text"])
-                        msg_type = message.get("type")
-                        
-                        if msg_type == "bot_registration" or msg_type == "register":
-                            # Already handled above, but acknowledge
-                            pass
-                        elif msg_type == "ping":
-                            # Respond to ping
-                            await websocket.send_text(json.dumps({"type": "pong"}))
-                        elif msg_type == "input_audio_buffer.commit" or msg_type == "commit":
-                            # User finished speaking - commit audio buffer
-                            try:
-                                await realtime_service._send_message({
-                                    "type": "input_audio_buffer.commit"
-                                })
-                            except Exception as e:
-                                logger.error(f"Failed to commit audio: {e}", exc_info=True)
-                        elif msg_type == "response.cancel" or msg_type == "interrupt":
-                            # User started speaking (interrupt current response)
-                            try:
-                                await realtime_service._send_message({
-                                    "type": "response.cancel"
-                                })
-                            except Exception as e:
-                                logger.error(f"Failed to interrupt: {e}", exc_info=True)
-                        elif msg_type == "response.create":
-                            # Trigger response generation after commit
-                            try:
-                                await realtime_service._send_message({
-                                    "type": "response.create"
-                                })
-                            except Exception as e:
-                                logger.error(f"Failed to create response: {e}", exc_info=True)
-                        elif msg_type == "end_stream":
-                            break
-                        elif msg_type == "text":
-                            # Text message (fallback for text input)
-                            text_payload = message.get("content", "")
-                            if text_payload:
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "Text input not supported in audio mode"
-                                }))
-                        else:
-                            logger.warning(f"Unknown message type: {msg_type}, full message: {message}")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse WebSocket text message: {e}, raw data: {data.get('text', '')[:100]}")
-                    except Exception as e:
-                        logger.error(f"Error processing WebSocket text message: {e}", exc_info=True)
-                    
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"Error in unified stream: {e}", exc_info=True)
-                break
-                
     except Exception as e:
-        logger.error(f"Unified bot audio stream error for session {session_id}: {e}", exc_info=True)
+        logger.error(f"[AURRAY] WebSocket error: {e}", exc_info=True)
+
     finally:
-        # Cleanup - only if this is the last WebSocket for this session
-        if session_id in rt_services.active_bot_sessions:
-            # Check if this is the same WebSocket (not a new connection)
-            if rt_services.active_bot_sessions[session_id] == websocket:
-                del rt_services.active_bot_sessions[session_id]
-                
-                # Only disconnect Realtime API if no other WebSocket is using it
-                # (In case of reconnection, a new WebSocket might have already been added)
-                if session_id not in rt_services.active_bot_sessions and session_id in active_realtime_sessions:
-                    try:
-                        await active_realtime_sessions[session_id].disconnect()
-                    except Exception:
-                        pass
-                    finally:
-                        # Double-check session still exists before deleting
-                        if session_id in active_realtime_sessions:
-                            del active_realtime_sessions[session_id]
+        # Cleanup
+        ws = rt_services.active_bot_sessions.get(session_id)
+        if ws is websocket:
+            rt_services.active_bot_sessions.pop(session_id, None)
 
-
-async def _initialize_realtime_session(
-    session_id: str, 
-    websocket: WebSocket,
-    current_transcript_ref: list,
-    current_ai_response_ref: list
-):
-    """Initialize Realtime API session for a given session_id."""
-    session_metadata = rt_services.bot_session_metadata.get(session_id, {})
-    meeting_id = session_metadata.get("meeting_id", session_id)
-    meeting_context = {
-        "meeting_id": meeting_id,
-        "session_id": session_id,
-        "participants": session_metadata.get("participants", []),
-        "topic": session_metadata.get("topic", "General meeting")
-    }
-    
-    # Initialize Realtime API service
-    realtime_service = RealtimeAPIService()
-    
-    # Set up event handlers
-    # Note: Handlers always use the current WebSocket from active_bot_sessions
-    # This allows reconnection without recreating the Realtime API session
-    async def on_audio_delta(audio_bytes: bytes):
-        """Handle audio output from Realtime API."""
-        # Always get the current WebSocket (handles reconnections)
-        current_ws = rt_services.active_bot_sessions.get(session_id)
-        if current_ws:
+        svc = active_realtime_sessions.get(session_id)
+        if svc:
             try:
-                # Send audio bytes directly to frontend
-                asyncio.create_task(current_ws.send_bytes(audio_bytes))
-            except Exception as e:
-                logger.error(f"Error sending audio: {e}")
-    
-    async def on_transcript_delta(transcript_delta: str):
-        """Handle real-time transcription and send to frontend."""
-        # Update transcript reference
-        if not current_transcript_ref:
-            current_transcript_ref.append("")
-        
-        # Handle full transcript or delta
-        if len(transcript_delta) > len(current_transcript_ref[0]):
-            current_transcript_ref[0] = transcript_delta
+                await svc.disconnect()
+            except:
+                pass
+            active_realtime_sessions.pop(session_id, None)
+
+
+
+# ======================================================================
+# == HELPERS ===========================================================
+# ======================================================================
+
+async def _safe_commit(rt_session, websocket, session_id):
+    """Commit safely and trigger response.create only once."""
+    try:
+        logger.info(f"[AURRAY] 📤 Sending input_audio_buffer.commit to OpenAI")
+        await rt_session._send_message({"type": "input_audio_buffer.commit"})
+        logger.info(f"[AURRAY] ✅ input_audio_buffer.commit sent successfully")
+
+        # Avoid double response.create
+        is_in_progress = await rt_session.is_response_in_progress()
+        logger.info(f"[AURRAY] 🔍 Response in progress check: {is_in_progress}")
+        if not is_in_progress:
+            logger.info(f"[AURRAY] 📤 Sending response.create to OpenAI")
+            await rt_session._send_message({"type": "response.create"})
+            logger.info(f"[AURRAY] ✅ response.create sent successfully")
         else:
-            current_transcript_ref[0] += transcript_delta
-        
-        # Send transcription to frontend
-        # Always get the current WebSocket (handles reconnections)
-        current_ws = rt_services.active_bot_sessions.get(session_id)
-        if current_ws:
-            try:
-                asyncio.create_task(current_ws.send_text(json.dumps({
+            logger.info(f"[AURRAY] ⏭️ Skipping response.create: response already in progress")
+
+    except Exception as e:
+        logger.error(f"[AURRAY] ❌ Commit failed: {e}", exc_info=True)
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": str(e)
+            }))
+        except:
+            pass
+
+
+async def _init_rt_session(session_id: str):
+    """Initialize Realtime API connection for this session."""
+    logger.info(f"[AURRAY] _init_rt_session: Starting initialization for {session_id}")
+    svc = RealtimeAPIService()
+    meeting_context = rt_services.bot_session_metadata.get(session_id, {})
+    logger.info(f"[AURRAY] _init_rt_session: Meeting context keys: {list(meeting_context.keys())}")
+
+    async def send_audio(audio_bytes: bytes):
+        ws = rt_services.active_bot_sessions.get(session_id)
+        if ws:
+            logger.info(f"[AURRAY] 🔊 Forwarding audio from OpenAI to frontend: {len(audio_bytes)} bytes")
+            await ws.send_bytes(audio_bytes)
+            logger.info(f"[AURRAY] ✅ Audio forwarded successfully")
+        else:
+            logger.warning(f"[AURRAY] _init_rt_session: No WebSocket found for {session_id} when sending audio")
+
+    async def send_transcript(delta: str):
+        ws = rt_services.active_bot_sessions.get(session_id)
+        if ws:
+            await ws.send_text(json.dumps({
                     "type": "transcription",
                     "session_id": session_id,
-                    "meeting_id": meeting_id,
-                    "content": current_transcript_ref[0]
-                })))
-            except Exception as e:
-                logger.error(f"Error sending transcript: {e}")
-    
-    async def on_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle tool calls."""
-        return await handle_tool_call(tool_name, arguments)
-    
-    async def on_response_done():
-        """Handle response completion."""
-        # Send completion message to frontend
-        # Always get the current WebSocket (handles reconnections)
-        current_ws = rt_services.active_bot_sessions.get(session_id)
-        if current_ws:
-            try:
-                asyncio.create_task(current_ws.send_text(json.dumps({
+                "content": delta
+            }))
+        else:
+            logger.warning(f"[AURRAY] _init_rt_session: No WebSocket found for {session_id} when sending transcript")
+
+    async def done():
+        ws = rt_services.active_bot_sessions.get(session_id)
+        if ws:
+            await ws.send_text(json.dumps({
                     "type": "tts_complete",
                     "session_id": session_id
-                })))
-            except Exception as e:
-                logger.error(f"Error sending completion: {e}")
-    
-    async def on_error(error_message: str):
-        """Handle errors."""
-        logger.error(f"Realtime API error: {error_message}")
-    
-    # Set handlers
-    realtime_service.on_audio_delta = on_audio_delta
-    realtime_service.on_transcript_delta = on_transcript_delta
-    realtime_service.on_tool_call = on_tool_call
-    realtime_service.on_response_done = on_response_done
-    realtime_service.on_error = on_error
-    
-    # Connect to Realtime API
-    connected = await realtime_service.connect(
+            }))
+        else:
+            logger.warning(f"[AURRAY] _init_rt_session: No WebSocket found for {session_id} when sending done")
+
+    svc.on_audio_delta = send_audio
+    svc.on_transcript_delta = send_transcript
+    svc.on_response_done = done
+
+    logger.info(f"[AURRAY] _init_rt_session: Calling svc.connect for {session_id}")
+    ok = await svc.connect(
         session_id=session_id,
+        assistant_name=meeting_context.get("name", "Aurray"),
         meeting_context=meeting_context,
-        voice="alloy",  # Can be customized per user
-        instructions=None,  # Uses default from service
-        tools=None  # Uses default tools
+        voice="alloy"
     )
     
-    if connected:
-        active_realtime_sessions[session_id] = realtime_service
+    if ok:
+        logger.info(f"[AURRAY] _init_rt_session: ✅ Realtime API connection successful for {session_id}")
+        active_realtime_sessions[session_id] = svc
     else:
-        logger.error(f"Failed to connect Realtime API for {session_id}")
-
+        logger.error(f"[AURRAY] _init_rt_session: ❌ RT session failed for {session_id}")

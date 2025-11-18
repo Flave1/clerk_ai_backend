@@ -13,7 +13,7 @@ from shared.schemas import MeetingContext, MeetingRole, TonePersonality
 from shared.config import get_settings
 
 from ..auth import get_current_user
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 from services.api.service_meeting_context import ServiceMeetingContext
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def get_meeting_context_service(dao: DynamoDBDAO) -> ServiceMeetingContext:
+def get_meeting_context_service(dao: MongoDBDAO) -> ServiceMeetingContext:
     return ServiceMeetingContext(dao)
 
 
@@ -90,7 +90,7 @@ class MeetingContextResponse(BaseModel):
 async def create_meeting_context(
     context_data: MeetingContextCreate,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Create a new meeting context."""
     try:
@@ -129,7 +129,7 @@ async def create_meeting_context(
 @router.get("/", response_model=List[MeetingContextResponse])
 async def get_meeting_contexts(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get all meeting contexts for the current user."""
     try:
@@ -150,7 +150,7 @@ async def get_meeting_contexts(
 async def get_meeting_context(
     context_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get a specific meeting context by ID."""
     try:
@@ -181,7 +181,7 @@ async def update_meeting_context(
     context_id: str,
     context_data: MeetingContextUpdate,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Update a meeting context."""
     try:
@@ -233,7 +233,7 @@ async def update_meeting_context(
 async def delete_meeting_context(
     context_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Delete a meeting context."""
     try:

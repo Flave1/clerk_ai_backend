@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from shared.schemas import Conversation, ConversationStatus, Turn
 
 from ..auth import get_current_user
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ async def get_conversations(
     limit: int = Query(10, le=100),
     offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get list of conversations for the authenticated user."""
     try:
@@ -98,7 +98,7 @@ async def get_conversations(
 async def get_conversation(
     conversation_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get a specific conversation. Only accessible by the owner."""
     try:
@@ -135,7 +135,7 @@ async def get_conversation(
 async def create_conversation(
     request: ConversationCreate,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Create a new conversation. Always associated with the authenticated user."""
     try:
@@ -171,7 +171,7 @@ async def update_conversation_status(
     status: str,
     summary: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Update conversation status. Only accessible by the owner."""
     try:
@@ -211,7 +211,7 @@ async def get_conversation_turns(
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get turns for a conversation. Only accessible by the owner."""
     try:
@@ -255,7 +255,7 @@ async def get_conversation_turns(
 async def delete_conversation(
     conversation_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Delete a conversation. Only accessible by the owner."""
     try:

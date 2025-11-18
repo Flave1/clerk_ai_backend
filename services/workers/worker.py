@@ -204,7 +204,7 @@ class ActionWorker:
     async def _update_action_status(self, action: Action):
         """Update action status in database."""
         try:
-            # This would update the action in DynamoDB
+            # This would update the action in MongoDB
             # For now, just log
             logger.info(f"Action {action.id} status: {action.status.value}")
 

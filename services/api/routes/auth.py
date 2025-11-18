@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from shared.schemas import User
 
 from ..auth import create_access_token, get_current_user, hash_password, verify_password
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class UserResponse(BaseModel):
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     request: RegisterRequest,
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Register a new user.
@@ -167,7 +167,7 @@ async def register(
 @router.post("/signin", response_model=AuthResponse)
 async def signin(
     request: SignInRequest,
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Sign in an existing user.
@@ -236,7 +236,7 @@ async def signin(
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_info(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Get current authenticated user information.
@@ -277,7 +277,7 @@ async def get_current_user_info(
 @router.post("/google", response_model=AuthResponse)
 async def google_oauth(
     request: GoogleOAuthRequest,
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """
     Google OAuth login/registration.

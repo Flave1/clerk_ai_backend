@@ -17,7 +17,7 @@ from ..services import (
     broadcast_to_conversation,
 )
 from .. import services as rt_services
-from services.api.dao import DynamoDBDAO, get_dao
+from services.api.dao import MongoDBDAO, get_dao
 from services.api.auth import get_current_user
 from services.api.service_meeting import ServiceMeeting
 from services.api.service_meeting_context import ServiceMeetingContext
@@ -45,7 +45,7 @@ class ExternalMeetingStartRequest(JoinMeetingRequest):
 async def start_conversation(
     request: Dict[str, Any],
     current_user: Dict[str, Any] = Depends(get_current_user),
-    dao: Optional[DynamoDBDAO] = Depends(get_dao),
+    dao: Optional[MongoDBDAO] = Depends(get_dao),
 ) -> Dict[str, Any]:
     """Start a new conversation with rollback on failure."""
     meeting_id: Optional[str] = None
@@ -69,7 +69,7 @@ async def start_conversation(
         context_id_str: Optional[str] = None
 
         # Use injected DAO when available; fallback to new instance
-        dao_instance = dao or DynamoDBDAO()
+        dao_instance = dao or MongoDBDAO()
         if not getattr(dao_instance, "initialized", False):
             await dao_instance.initialize()
         context_service = ServiceMeetingContext(dao_instance)
@@ -86,51 +86,51 @@ async def start_conversation(
                 raise HTTPException(status_code=404, detail="Default meeting context not found! Please create one")
             context_id_str = str(context.id)
 
-            # Normalize meeting platform: "clerk" -> "aurray", accept "aurray" directly
-            if meeting_platform:
-                platform_lower = meeting_platform.lower()
-                if platform_lower == "clerk":
-                    normalized_platform = "aurray"
-                elif platform_lower == "aurray":
-                    normalized_platform = "aurray"
-                else:
-                    normalized_platform = meeting_platform
-            else:
+        # Normalize meeting platform: "clerk" -> "aurray", accept "aurray" directly
+        if meeting_platform:
+            platform_lower = meeting_platform.lower()
+            if platform_lower == "clerk":
                 normalized_platform = "aurray"
+            elif platform_lower == "aurray":
+                normalized_platform = "aurray"
+            else:
+                normalized_platform = meeting_platform
+        else:
+            normalized_platform = "aurray"
 
-            meeting_service = ServiceMeeting(dao_instance)
-            meeting = await meeting_service.create_meeting_record(
-                user_id=context.user_id,
-                meeting_type=normalized_platform,
-                context_id=context_id_str,
-                voice_id=context.voice_id,
-                bot_name=context.name,
-                status=MeetingStatus.ACTIVE,
-                description=f"Meeting created with {context.name}",
-            )
-            meeting_id = str(meeting.id)
-            metadata.update(
-                {
-                    "meeting_id": meeting_id,
-                    "context_id": context_id_str,
-                    "meeting_url": meeting.meeting_url,
-                }
-            )
+        meeting_service = ServiceMeeting(dao_instance)
+        meeting = await meeting_service.create_meeting_record(
+            user_id=context.user_id,
+            meeting_type=normalized_platform,
+            context_id=context_id_str,
+            voice_id=context.voice_id,
+            bot_name=context.name,
+            status=MeetingStatus.ACTIVE,
+            description=f"Meeting created with {context.name}",
+        )
+        meeting_id = str(meeting.id)
+        metadata.update(
+            {
+                "meeting_id": meeting_id,
+                "context_id": context_id_str,
+                "meeting_url": meeting.meeting_url,
+            }
+        )
 
-            if context_id_str is None:
-                raise HTTPException(status_code=500, detail="Failed to resolve context identifier")
+        if context_id_str is None:
+            raise HTTPException(status_code=500, detail="Failed to resolve context identifier")
 
-            payload = await context_service.fetch_context_payload(
-                context_id_str, str(context.user_id)
-            )
-            if payload:
-                try:
-                    await context_service.cache_payload(meeting_id, payload)
-                except Exception as cache_error:
-                    logger.warning(
-                        "Failed to cache meeting context payload in in-process cache: %s. Continuing without cache.",
-                        cache_error,
-                    )
+        payload = await context_service.fetch_context_payload(
+            context_id_str, str(context.user_id)
+        )
+        if payload:
+            try:
+                await context_service.cache_payload(meeting_id, payload)
+            except Exception as cache_error:
+                logger.warning(
+                    "Failed to cache meeting context payload in in-process cache: %s. Continuing without cache.",
+                    cache_error,
+                )
 
         if rt_services.turn_manager is None:
             raise HTTPException(
@@ -138,11 +138,44 @@ async def start_conversation(
                 detail="Turn manager is not initialized. Please check server logs."
             )
 
+        # Build initial participants for conversation metadata
+        # Participant 1: Context (bot/assistant)
+        context_participant = {
+            "id": str(context.id),
+            "name": context.name,
+            "role": "context",
+            "isHost": False,
+        }
+        # Participant 2: Current authenticated user
+        current_user_participant = {
+            "id": str(current_user.get("user_id")) if current_user else str(user_id),
+            "name": (current_user.get("name") or current_user.get("email")) if current_user else str(user_id),
+            "role": "user",
+            "isHost": True,
+        }
+        metadata["conversation_participants"] = [current_user_participant, context_participant]
+
+        # Prepare meeting context for bot session metadata
+        meeting_context = {
+            "id": str(context.id),
+            "name": context.name,
+            "user_id": str(context.user_id),
+            "voice_id": context.voice_id if hasattr(context, "voice_id") else None,
+            "context_id": context_id_str,
+            "context_description": context.context_description,
+            "meeting_id": meeting_id if meeting_id else None,
+        }
+
         conversation = await rt_services.turn_manager.start_conversation(
-            room_id, user_id, metadata=metadata
+            meeting_id, room_id, 
+            user_id, 
+            metadata=metadata
         )
-        conversation_id = str(conversation.id)
+        conversation_id = conversation.id
         active_conversations[conversation_id] = conversation
+        
+        # Set meeting context in bot_session_metadata (session_id is typically conversation_id)
+        rt_services.bot_session_metadata[conversation_id] = meeting_context
 
         if meeting_id:
             base_frontend = settings.frontend_base_url or "http://localhost:3000"
@@ -253,6 +286,31 @@ async def join_conversation(conversation_id: str, request: Dict[str, str]) -> Di
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/{conversation_id}/metadata")
+async def get_conversation_metadata(conversation_id: str) -> Dict[str, Any]:
+    """Get metadata for an active conversation (RT Gateway in-memory state)."""
+    try:
+        if rt_services.turn_manager is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Turn manager is not initialized. Please check server logs."
+            )
+
+        conversation = rt_services.turn_manager.conversations.get(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return {
+            "conversation_id": conversation_id,
+            "metadata": conversation.metadata or {},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get conversation metadata for {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _resolve_base_api_url() -> str:
     """Resolve the base URL for calling internal API endpoints."""
     if settings.api_base_url:
@@ -275,7 +333,7 @@ async def start_external_meeting(
     if not settings.aurray_api_key:
         raise HTTPException(status_code=500, detail="Aurray API key is not configured")
 
-    webhook_url = f"{_resolve_base_api_url()}/v1/api.aurray.net/join_meeting"
+    webhook_url = f"{_resolve_base_api_url()}/api/v1/ws/join_meeting"
     headers = {
         "Authorization": f"Bearer {settings.aurray_api_key}",
         "Content-Type": "application/json",
@@ -384,8 +442,8 @@ async def delete_conversation(conversation_id: str) -> Dict[str, Any]:
                 dao_instance = get_dao()
             except RuntimeError:
                 # Fallback if DAO not initialized (shouldn't happen in production)
-                from services.api.dao import DynamoDBDAO
-                dao_instance = DynamoDBDAO()
+                from services.api.dao import MongoDBDAO
+                dao_instance = MongoDBDAO()
                 await dao_instance.initialize()
             
             await dao_instance.delete_conversation(conversation_id)
@@ -435,8 +493,8 @@ async def bulk_delete_conversations(request: Dict[str, Any]) -> Dict[str, Any]:
                         dao_instance = get_dao()
                     except RuntimeError:
                         # Fallback if DAO not initialized (shouldn't happen in production)
-                        from services.api.dao import DynamoDBDAO
-                        dao_instance = DynamoDBDAO()
+                        from services.api.dao import MongoDBDAO
+                        dao_instance = MongoDBDAO()
                         await dao_instance.initialize()
                     
                     await dao_instance.delete_conversation(conversation_id)

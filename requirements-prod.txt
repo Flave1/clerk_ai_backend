@@ -14,7 +14,7 @@ websockets==12.0
 openai>=1.6.1,<2.0.0  # Used for OpenAI API calls
 # anthropic>=0.16.0,<1.0.0  # REMOVED: Required by langchain-anthropic - comment back in if needed
 elevenlabs==0.2.26
-# openai-whisper==20231117  # REMOVED: Very large (~1-2GB), code uses OpenAI API (whisper-1) instead
+# openai-whisper==20231117  # REMOVED: Very large (~1-2GB), use external service if needed
 deepgram-sdk>=3.2.0  # Real-time STT with Deepgram Nova-2
 
 # LangGraph and LangChain - REMOVED
@@ -53,13 +53,14 @@ google-api-python-client==2.110.0
 slack-sdk==3.26.1
 
 # Meeting Agent Dependencies
-selenium==4.15.2
-webdriver-manager==4.0.1
-# pyzoomus==1.0.0  # Package not available - using mock implementation in zoom_client.py
+selenium==4.15.2  # Needed for Google Meet client automation
+# webdriver-manager==4.0.1  # REMOVED: Not used anywhere in codebase
 msal==1.24.1
 apscheduler==3.10.4
+docker==7.1.0  # Docker SDK for container management in scheduler
 
 # Data Processing
+# Only include if actually needed for production
 numpy>=1.26,<2.0.0  # Used in stt.py for audio processing
 # scipy==1.11.4  # REMOVED: Not used anywhere (~200-300MB)
 # librosa==0.10.1  # REMOVED: Not used anywhere (~200-300MB)
@@ -68,20 +69,21 @@ pydub>=0.25.1  # Audio processing (MP3 to PCM conversion) - used in tts.py
 
 # Redis
 redis==5.0.1
-hiredis==2.2.3  # Optional: faster Redis client
+# hiredis==2.2.3  # REMOVED: Optional performance boost, not used in codebase
 
 # Monitoring & Logging
-structlog==23.2.0
-prometheus-client==0.19.0
+# structlog==23.2.0  # REMOVED: Not used anywhere in codebase
+# prometheus-client==0.19.0  # REMOVED: Not used anywhere in codebase
 
-# Testing - MOVED to requirements-dev.txt
+# Testing - REMOVED from production
 # pytest==7.4.3
 # pytest-asyncio==0.21.1
 # pytest-mock==3.12.0
 # moto[boto3]==4.2.14
 
-# Development - MOVED to requirements-dev.txt
+# Development - REMOVED from production
 # black==23.11.0
 # isort==5.12.0
 # flake8==6.1.0
 # mypy==1.7.1
+

@@ -59,6 +59,7 @@ class MeetingPlatform(str, Enum):
     GOOGLE_MEET = "google_meet"
     ZOOM = "zoom"
     MICROSOFT_TEAMS = "microsoft_teams"
+    AURRAY = "aurray"
 
 
 class MeetingStatus(str, Enum):
@@ -90,7 +91,7 @@ class User(BaseModel):
 class Conversation(BaseModel):
     """Conversation model."""
 
-    id: UUID = Field(default_factory=uuid4)
+    id: str
     user_id: UUID
     room_id: str
     status: ConversationStatus = ConversationStatus.ACTIVE
@@ -262,7 +263,7 @@ class MeetingSummary(BaseModel):
 
 
 class Meeting(BaseModel):
-    """Meeting model for DynamoDB storage."""
+    """Meeting model for MongoDB storage."""
     
     id: UUID = Field(default_factory=uuid4)
     user_id: Optional[UUID] = None  # User who created/owns the meeting
@@ -300,6 +301,12 @@ class Meeting(BaseModel):
     audio_enabled: bool = True
     video_enabled: bool = False
     recording_enabled: bool = False
+    
+    # Bot settings
+    transcript: bool = False
+    voice_id: Optional[str] = None
+    bot_name: Optional[str] = None
+    context_id: Optional[str] = None  # Meeting context ID
 
 
 class TranscriptionChunk(BaseModel):
@@ -362,6 +369,82 @@ class ApiKey(BaseModel):
     last_used_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     scopes: List[str] = Field(default_factory=list)  # Permissions/scopes
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class IntegrationStatus(str, Enum):
+    """Integration status enumeration."""
+    
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    EXPIRED = "expired"
+    ERROR = "error"
+
+
+class UserIntegration(BaseModel):
+    """User integration model for OAuth integrations."""
+    
+    id: UUID = Field(default_factory=uuid4)
+    user_id: UUID
+    integration_id: str  # e.g., "google_workspace", "slack"
+    status: IntegrationStatus = IntegrationStatus.DISCONNECTED
+    access_token: Optional[str] = None  # Encrypted at rest
+    refresh_token: Optional[str] = None  # Encrypted at rest
+    token_type: str = "Bearer"
+    expires_at: Optional[datetime] = None
+    scope: Optional[str] = None  # Comma-separated scopes
+    connected_at: Optional[datetime] = None
+    last_used_at: Optional[datetime] = None
+    last_refreshed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)  # Platform-specific data
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class NewsletterSubscription(BaseModel):
+    """Newsletter subscription model."""
+    
+    email: str
+    name: str = ""
+    country: str = ""
+    signed_up_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class MeetingRole(str, Enum):
+    """Meeting role enumeration."""
+    
+    PARTICIPANT = "participant"
+    MODERATOR = "moderator"
+    OBSERVER = "observer"
+    FACILITATOR = "facilitator"
+
+
+class TonePersonality(str, Enum):
+    """Tone personality enumeration."""
+    
+    FORMAL = "formal"
+    FRIENDLY = "friendly"
+    CONFIDENT = "confident"
+    EMPATHETIC = "empathetic"
+    ANALYTICAL = "analytical"
+    CUSTOM = "custom"
+
+
+class MeetingContext(BaseModel):
+    """Meeting context model."""
+    
+    id: UUID = Field(default_factory=uuid4)
+    user_id: UUID
+    name: str
+    voice_id: str
+    context_description: str
+    tools_integrations: List[str] = Field(default_factory=list)
+    meeting_role: MeetingRole = MeetingRole.PARTICIPANT
+    tone_personality: TonePersonality = TonePersonality.FRIENDLY
+    custom_tone: Optional[str] = None
+    is_default: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

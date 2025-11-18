@@ -22,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from shared.config import get_settings
 
 # API imports
-from services.api.dao import DynamoDBDAO, set_dao_instance
+from services.api.dao import MongoDBDAO, set_dao_instance
 from services.api.routes import actions, auth, rooms, meetings, api_keys, webhooks, integrations, meeting_contexts, newsletter
 from services.api.ws import ConnectionManager
 
@@ -32,7 +32,7 @@ from services.rt_gateway.services import (
     active_conversations,
     event_publisher,
     external_turn_manager,
-    llm_service,
+    # llm_service,  # REMOVED: LLM service removed
     stt_service,
     tts_service,
     turn_manager,
@@ -41,7 +41,7 @@ from services.rt_gateway.services import (
 from services.rt_gateway.routes import (
     bot,
     conversations,
-    llm,
+    # llm,  # REMOVED: LLM service removed
     stt,
     tts,
 )
@@ -64,15 +64,19 @@ settings = get_settings()
 
 # API global services
 connection_manager = ConnectionManager()
-dao = DynamoDBDAO()
+dao = MongoDBDAO()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Unified application lifespan manager."""
     global turn_manager, external_turn_manager, stt_service, tts_service
-    global llm_service, event_publisher, connection_manager, dao
+    # global llm_service,  # REMOVED: LLM service removed
+    global event_publisher, connection_manager, dao
 
     logger.info("Starting unified API and RT Gateway services...")
+    
+    # Initialize rt_services early to avoid UnboundLocalError in finally block
+    rt_services = None
 
     try:
         # Initialize API services first (lighter)
@@ -88,7 +92,7 @@ async def lifespan(app: FastAPI):
         # Import here to avoid circular imports
         from services.rt_gateway.events import EventPublisher
         from services.rt_gateway.external_turn_manager import ExternalTurnManager
-        from services.rt_gateway.llm import LLMService
+        # from services.rt_gateway.llm import LLMService  # REMOVED: LLM service removed
         from services.rt_gateway.stt import STTService
         from services.rt_gateway.tts import TTSService
         from services.rt_gateway.turn_manager import TurnManager
@@ -155,36 +159,13 @@ async def lifespan(app: FastAPI):
                 logger.error(f"❌ Failed to create fallback TTS service: {fallback_error}")
                 rt_services.tts_service = None
         
-        # Initialize LLM service (gracefully handle failures)
+        # LLM service removed - TurnManager and ExternalTurnManager will work without it
         llm_service = None
-        try:
-            # Pass initialized DAO to LLMService
-            llm_service = LLMService(dao=dao)
-            rt_services.llm_service = llm_service
-            logger.info("✅ LLM service initialized")
-            # Log service state for debugging
-            if llm_service.llm is None:
-                logger.warning("⚠️ LLM service object created but LLM client is None (OpenAI API key may be missing)")
-            else:
-                logger.info("✅ LLM client initialized successfully")
-        except Exception as e:
-            logger.error(f"⚠️ Failed to initialize LLM service: {e}", exc_info=True)
-            logger.warning("Creating fallback LLM service object...")
-            # Create a minimal service object even if initialization fails
-            try:
-                llm_service = LLMService.__new__(LLMService)
-                llm_service.llm = None
-                llm_service.tools = []
-                llm_service.graph = None
-                rt_services.llm_service = llm_service
-                logger.warning("⚠️ LLM service fallback object created (limited functionality)")
-            except Exception as fallback_error:
-                logger.error(f"❌ Failed to create fallback LLM service: {fallback_error}")
-                rt_services.llm_service = None
+        logger.info("ℹ️ LLM service removed - using OpenAI API directly instead")
         
         try:
-            # Pass initialized DAO to TurnManager
-            turn_manager = TurnManager(llm_service, event_publisher, tts_service, dao=dao)
+            # Pass initialized DAO to TurnManager (llm_service can be None)
+            turn_manager = TurnManager(None, event_publisher, tts_service, dao=dao)
             rt_services.turn_manager = turn_manager
             logger.info("✅ Turn manager initialized successfully")
         except Exception as e:
@@ -193,7 +174,8 @@ async def lifespan(app: FastAPI):
             raise
 
         if settings.use_external_turn_manager:
-            external_turn_manager = ExternalTurnManager(llm_service)
+            # ExternalTurnManager can work without llm_service (will use None)
+            external_turn_manager = ExternalTurnManager(None)
             await external_turn_manager.initialize()
             rt_services.external_turn_manager = external_turn_manager
             logger.info("✅ External turn manager initialized")
@@ -212,8 +194,11 @@ async def lifespan(app: FastAPI):
         if external_turn_manager:
             await external_turn_manager.cleanup()
         # Cleanup state manager
-        if rt_services.state_manager:
-            await rt_services.state_manager.cleanup()
+        if rt_services and rt_services.state_manager:
+            try:
+                await rt_services.state_manager.cleanup()
+            except Exception as e:
+                logger.warning(f"Error cleaning up state manager: {e}")
         logger.info("Shutdown complete")
 
 app = FastAPI(
@@ -376,11 +361,11 @@ app.include_router(
     tags=["tts"],
 )
 
-app.include_router(
-    llm.router,
-    prefix="/llm",
-    tags=["llm"],
-)
+# app.include_router(
+#     llm.router,
+#     prefix="/llm",
+#     tags=["llm"],
+# )  # REMOVED: LLM service removed
 
 # Bot HTTP routes
 app.include_router(

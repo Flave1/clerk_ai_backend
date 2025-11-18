@@ -20,12 +20,13 @@ if sys.version_info >= (3, 12):
         return type_._evaluate(globalns, localns, set(), recursive_guard=set())
     pydantic_v1_typing.evaluate_forwardref = patched_evaluate_forwardref
 
-from langchain_community.llms import OpenAI
-from langchain_community.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
-from langchain.chains import LLMChain
-from langchain.output_parsers import PydanticOutputParser
+# LangChain imports - REMOVED, service will use OpenAI directly or fail gracefully
+# from langchain_community.llms import OpenAI  # REMOVED: LangChain removed
+# from langchain_community.chat_models import ChatOpenAI  # REMOVED: LangChain removed
+# from langchain.schema import HumanMessage, SystemMessage  # REMOVED: LangChain removed
+# from langchain.prompts import ChatPromptTemplate, PromptTemplate  # REMOVED: LangChain removed
+# from langchain.chains import LLMChain  # REMOVED: LangChain removed
+# from langchain.output_parsers import PydanticOutputParser  # REMOVED: LangChain removed
 from pydantic import BaseModel, Field
 
 from shared.config import get_settings
@@ -50,105 +51,25 @@ class SummarizationService:
     """Service for summarizing meeting content and extracting insights."""
     
     def __init__(self):
-        self.llm: Optional[ChatOpenAI] = None
-        self.parser: Optional[PydanticOutputParser] = None
-        self.prompt_template: Optional[ChatPromptTemplate] = None
+        # LangChain removed - service will return empty summaries
+        self.llm = None  # Removed: ChatOpenAI
+        self.parser = None  # Removed: PydanticOutputParser
+        self.prompt_template = None  # Removed: ChatPromptTemplate
         self.is_initialized = False
+        logger.warning("⚠️ SummarizationService: LangChain removed - summarization will return empty summaries")
         
     async def initialize(self) -> None:
         """Initialize the summarization service."""
-        logger.info("Initializing summarization service...")
-        
-        try:
-            if not settings.openai_api_key:
-                raise ValueError("OpenAI API key not configured")
-            
-            # Initialize LLM
-            self.llm = ChatOpenAI(
-                model_name="gpt-4",
-                temperature=0.3,
-                api_key=settings.openai_api_key
-            )
-            
-            # Initialize output parser
-            self.parser = PydanticOutputParser(pydantic_object=MeetingAnalysis)
-            
-            # Create prompt template
-            self.prompt_template = ChatPromptTemplate.from_messages([
-                SystemMessage(content="""You are an expert meeting analyst. Your task is to analyze meeting transcriptions and extract key insights, decisions, and action items.
-
-Please analyze the provided meeting transcription and return a structured analysis including:
-1. Main topics discussed
-2. Key decisions made
-3. Action items with assignees and due dates
-4. A concise summary
-5. Overall sentiment
-6. Meeting duration
-
-Be thorough but concise. Focus on actionable insights and important decisions."""),
-                HumanMessage(content="""Meeting Transcription:
-{transcription}
-
-{format_instructions}
-
-Please analyze this meeting transcription and provide a structured analysis.""")
-            ])
-            
-            self.is_initialized = True
-            logger.info("Summarization service initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize summarization service: {e}")
-            raise
+        logger.warning("⚠️ SummarizationService.initialize() called but LangChain is removed - service will not work")
+        self.is_initialized = False
+        # Don't raise - allow service to exist but be unusable
     
     async def summarize_meeting(self, meeting: Meeting, transcription_chunks: List[TranscriptionChunk]) -> MeetingSummary:
         """Summarize a meeting from transcription chunks."""
-        logger.info(f"Summarizing meeting: {meeting.title}")
+        logger.warning(f"⚠️ Summarize meeting called for {meeting.title} but LangChain is removed - returning empty summary")
         
-        if not self.is_initialized:
-            await self.initialize()
-        
-        try:
-            # Combine transcription chunks
-            full_transcription = self._combine_transcription_chunks(transcription_chunks)
-            
-            if not full_transcription.strip():
-                logger.warning("No transcription content to summarize")
-                return self._create_empty_summary(meeting.id)
-            
-            # Generate summary using LLM
-            analysis = await self._analyze_transcription(full_transcription)
-            
-            # Convert action items to proper format
-            action_items = []
-            for item_data in analysis.action_items:
-                action_item = ActionItem(
-                    description=item_data.get('description', ''),
-                    assignee=item_data.get('assignee'),
-                    due_date=self._parse_due_date(item_data.get('due_date')),
-                    priority=item_data.get('priority', 'medium'),
-                    status='pending'
-                )
-                action_items.append(action_item)
-            
-            # Create meeting summary
-            summary = MeetingSummary(
-                meeting_id=meeting.id,
-                topics_discussed=analysis.topics_discussed,
-                key_decisions=analysis.key_decisions,
-                action_items=action_items,
-                summary_text=analysis.summary_text,
-                sentiment=analysis.sentiment,
-                duration_minutes=analysis.duration_minutes or self._calculate_duration(meeting),
-                created_at=datetime.utcnow()
-            )
-            
-            logger.info(f"Successfully summarized meeting: {meeting.title}")
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Failed to summarize meeting: {e}")
-            return self._create_empty_summary(meeting.id)
+        # LangChain removed - return empty summary
+        return self._create_empty_summary(meeting.id)
     
     def _combine_transcription_chunks(self, chunks: List[TranscriptionChunk]) -> str:
         """Combine transcription chunks into a single text."""
@@ -164,33 +85,17 @@ Please analyze this meeting transcription and provide a structured analysis.""")
         return combined_text
     
     async def _analyze_transcription(self, transcription: str) -> MeetingAnalysis:
-        """Analyze transcription using LLM."""
-        try:
-            # Format the prompt
-            formatted_prompt = self.prompt_template.format_messages(
-                transcription=transcription,
-                format_instructions=self.parser.get_format_instructions()
-            )
-            
-            # Get response from LLM
-            response = await self.llm.agenerate([formatted_prompt])
-            
-            # Parse response
-            analysis = self.parser.parse(response.generations[0][0].text)
-            
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"LLM analysis error: {e}")
-            # Return default analysis if parsing fails
-            return MeetingAnalysis(
-                topics_discussed=["Meeting topics"],
-                key_decisions=["Key decisions"],
-                action_items=[],
-                summary_text="Meeting summary could not be generated due to analysis error.",
-                sentiment="neutral",
-                duration_minutes=None
-            )
+        """Analyze transcription using LLM - DISABLED: LangChain removed."""
+        logger.warning("⚠️ _analyze_transcription called but LangChain is removed")
+        # Return default analysis since LangChain is removed
+        return MeetingAnalysis(
+            topics_discussed=["Meeting topics"],
+            key_decisions=["Key decisions"],
+            action_items=[],
+            summary_text="Meeting summary could not be generated - LangChain summarization service removed.",
+            sentiment="neutral",
+            duration_minutes=None
+        )
     
     def _parse_due_date(self, due_date_str: Optional[str]) -> Optional[datetime]:
         """Parse due date string to datetime."""
@@ -226,52 +131,10 @@ Please analyze this meeting transcription and provide a structured analysis.""")
         )
     
     async def generate_action_items(self, transcription: str) -> List[ActionItem]:
-        """Generate action items from transcription."""
-        logger.info("Generating action items from transcription")
-        
-        if not self.is_initialized:
-            await self.initialize()
-        
-        try:
-            # Create specific prompt for action items
-            action_prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(content="""You are an expert at extracting action items from meeting transcriptions. 
-
-Extract all action items mentioned in the transcription. For each action item, identify:
-1. The description of the task
-2. Who is responsible (assignee)
-3. When it's due (due date)
-4. Priority level (low, medium, high)
-
-Return the action items in a structured format."""),
-                HumanMessage(content=f"Meeting Transcription:\n{transcription}\n\nExtract all action items from this transcription.")
-            ])
-            
-            # Get response from LLM
-            response = await self.llm.agenerate([action_prompt.format_messages()])
-            
-            # Parse response (simplified for now)
-            action_items = []
-            response_text = response.generations[0][0].text
-            
-            # Simple parsing - in production, use more sophisticated parsing
-            lines = response_text.split('\n')
-            for line in lines:
-                if line.strip() and ('action' in line.lower() or 'task' in line.lower() or 'todo' in line.lower()):
-                    action_item = ActionItem(
-                        description=line.strip(),
-                        assignee=None,
-                        due_date=None,
-                        priority='medium',
-                        status='pending'
-                    )
-                    action_items.append(action_item)
-            
-            return action_items
-            
-        except Exception as e:
-            logger.error(f"Action item generation error: {e}")
-            return []
+        """Generate action items from transcription - DISABLED: LangChain removed."""
+        logger.warning("⚠️ generate_action_items called but LangChain is removed - returning empty list")
+        # LangChain removed - return empty list
+        return []
     
     async def generate_meeting_notes(self, meeting: Meeting, transcription_chunks: List[TranscriptionChunk]) -> str:
         """Generate formatted meeting notes."""

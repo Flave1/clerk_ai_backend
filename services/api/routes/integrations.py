@@ -15,7 +15,7 @@ from shared.schemas import UserIntegration, IntegrationStatus
 from shared.config import get_settings
 
 from ..auth import get_current_user
-from ..dao import DynamoDBDAO, get_dao
+from ..dao import MongoDBDAO, get_dao
 from services.integrations.oauth_service import get_oauth_service
 
 logger = logging.getLogger(__name__)
@@ -195,7 +195,7 @@ class OAuthCallbackRequest(BaseModel):
 @router.get("/", response_model=List[IntegrationResponse])
 async def list_integrations(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """List all available integrations with connection status for the current user."""
     try:
@@ -251,7 +251,7 @@ class ConnectedIntegrationResponse(BaseModel):
 @router.get("/connected", response_model=List[ConnectedIntegrationResponse])
 async def get_connected_integrations(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get all connected integrations for the current user with full integration details."""
     try:
@@ -318,7 +318,7 @@ async def get_connected_integrations(
 async def get_integration(
     integration_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get details of a specific integration."""
     try:
@@ -365,7 +365,7 @@ async def get_integration(
 async def get_oauth_authorize_url(
     integration_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get OAuth authorization URL for an integration."""
     try:
@@ -445,7 +445,7 @@ async def oauth_callback(
     state: str = Query(...),
     error: Optional[str] = Query(None),
     error_description: Optional[str] = Query(None),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Handle OAuth callback after user authorization."""
     try:
@@ -543,7 +543,7 @@ async def oauth_callback(
 async def disconnect_integration(
     integration_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Disconnect an integration."""
     try:
@@ -585,7 +585,7 @@ async def disconnect_integration(
 async def get_integration_status(
     integration_id: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao),
+    dao: MongoDBDAO = Depends(get_dao),
 ):
     """Get connection status for a specific integration."""
     try:

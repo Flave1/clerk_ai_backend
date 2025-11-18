@@ -6,8 +6,8 @@ set -e
 
 AWS_REGION="us-east-1"
 AWS_ACCOUNT_ID="588412562130"
-ECR_REPOSITORY="clerk_backend"
-IMAGE_TAG="stagingv1.0.0"
+ECR_REPOSITORY="aurray_backend"
+IMAGE_TAG="stagingv1.1.0"
 CLUSTER_NAME="${1:-clerk-cluster}"
 SERVICE_NAME="${2:-clerk-backend-service}"
 

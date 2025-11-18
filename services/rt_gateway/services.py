@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from .events import EventPublisher
 from .external_turn_manager import ExternalTurnManager
-from .llm import LLMService
+# from .llm import LLMService  # REMOVED: LLM service removed
 from .stt import STTService
 from .tts import TTSService
 from .turn_manager import TurnManager
@@ -22,7 +22,7 @@ turn_manager: Optional[TurnManager] = None
 external_turn_manager: Optional[ExternalTurnManager] = None
 stt_service: Optional[STTService] = None
 tts_service: Optional[TTSService] = None
-llm_service: Optional[LLMService] = None
+# llm_service: Optional[LLMService] = None  # REMOVED: LLM service removed
 event_publisher: Optional[EventPublisher] = None
 state_manager: Optional[StateManager] = None
 realtime_api_service: Optional[RealtimeAPIService] = None

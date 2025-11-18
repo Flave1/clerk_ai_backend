@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from services.api.auth import get_current_user
-from services.api.dao import get_dao, DynamoDBDAO
+from services.api.dao import get_dao, MongoDBDAO
 from shared.config import get_settings
 from shared.schemas import Meeting, MeetingSummary, MeetingStatus, MeetingPlatform, ActionItem
 from services.meeting_agent.models import (
@@ -74,7 +74,7 @@ notification_service = create_notification_service()
 summarization_service = create_summarization_service()
 
 
-def get_meeting_service(dao: DynamoDBDAO) -> ServiceMeeting:
+def get_meeting_service(dao: MongoDBDAO) -> ServiceMeeting:
     return ServiceMeeting(dao)
 
 
@@ -85,11 +85,11 @@ async def get_meetings(
     limit: int = 50,
     offset: int = 0,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get list of meetings for the authenticated user with optional filtering."""
     try:
-        # Query DynamoDB for meetings filtered by user_id
+        # Query MongoDB for meetings filtered by user_id
         user_id = current_user["user_id"]
         meeting_service = get_meeting_service(dao)
         meetings = await meeting_service.get_meetings(limit=limit + offset, user_id=user_id)
@@ -113,11 +113,11 @@ async def get_meetings(
 async def get_meeting_summaries(
     limit: int = 50,
     offset: int = 0,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get all meeting summaries."""
     try:
-        # In a real implementation, you would query DynamoDB
+        # In a real implementation, you would query MongoDB
         # For now, return mock data
         summaries = []
         
@@ -132,7 +132,7 @@ async def get_meeting_summaries(
 async def bot_joined(
     meeting_id: str,
     request: BotJoinedRequest,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Confirm a bot has joined a meeting and mark the meeting as bot_joined.
@@ -260,7 +260,7 @@ async def bot_joined(
 async def bot_left(
     meeting_id: str,
     request: BotLeftRequest,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Notify the backend that a bot has left a meeting.
@@ -481,11 +481,11 @@ async def generate_meeting_url(request: GenerateMeetingUrlRequest) -> GenerateMe
 @router.get("/active", response_model=List[Meeting])
 async def get_active_meetings(
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get list of currently active meetings for the authenticated user."""
     try:
-        # Query DynamoDB for meetings filtered by user_id and filter for active ones
+        # Query MongoDB for meetings filtered by user_id and filter for active ones
         user_id = current_user["user_id"]
         meeting_service = get_meeting_service(dao)
         meetings = await meeting_service.get_meetings(limit=100, user_id=user_id)
@@ -534,7 +534,7 @@ async def get_meeting_agent_status():
 async def bulk_delete_meetings(
     meeting_ids: List[str],
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Delete multiple meetings at once. Only accessible for user's own meetings.
@@ -587,12 +587,12 @@ async def bulk_delete_meetings(
 async def get_meeting(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get a specific meeting by ID. Only accessible by the owner."""
     try:
         meeting_service = get_meeting_service(dao)
-        # Query DynamoDB for the meeting
+        # Query MongoDB for the meeting
         meeting = await meeting_service.get_meeting(str(meeting_id))
         
         if not meeting:
@@ -613,7 +613,7 @@ async def get_meeting(
 async def get_meeting_summary(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get meeting summary by meeting ID. Only accessible by the owner."""
     try:
@@ -622,7 +622,7 @@ async def get_meeting_summary(
         meeting = await meeting_service.get_meeting(str(meeting_id))
         if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
-        # In a real implementation, you would query DynamoDB for the summary
+        # In a real implementation, you would query MongoDB for the summary
         # For now, return a mock summary
         summary = MeetingSummary(
             meeting_id=meeting_id,
@@ -652,7 +652,7 @@ async def join_meeting(
     meeting_id: UUID,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Manually trigger joining a meeting with the bot. Only accessible by the owner.
@@ -755,7 +755,7 @@ async def join_meeting(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, dao: DynamoDBDAO, bot_id: str):
+async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, dao: MongoDBDAO, bot_id: str):
     """
     Background task to handle transcription and summarization using Recall.ai.
     
@@ -874,7 +874,7 @@ async def _process_meeting_in_background(meeting: Meeting, recall_client: Any, d
 async def leave_meeting(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Manually trigger leaving a meeting and stopping transcription/summarization. Only accessible by the owner.
@@ -946,7 +946,7 @@ async def send_meeting_notification(
     notification_type: str,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Send notification for a meeting. Only accessible by the owner."""
     try:
@@ -989,7 +989,7 @@ async def send_meeting_notification(
 async def get_meeting_participants(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get list of meeting participants. Only accessible by the owner."""
     try:
@@ -1042,7 +1042,7 @@ async def get_meeting_participants(
 async def get_meeting_transcription(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get meeting transcription. Only accessible by the owner."""
     try:
@@ -1069,7 +1069,7 @@ async def get_meeting_transcription(
 async def get_meeting_action_items(
     meeting_id: UUID,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Get action items for a meeting. Only accessible by the owner."""
     try:
@@ -1097,7 +1097,7 @@ async def update_action_item(
     action_item_id: UUID,
     status: str,
     current_user: dict = Depends(get_current_user),
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Update action item status. Only accessible by the owner."""
     try:
@@ -1105,7 +1105,7 @@ async def update_action_item(
         meeting = await get_meeting_service(dao).get_meeting(str(meeting_id))
         if meeting and meeting.user_id and str(meeting.user_id) != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
-        # In a real implementation, you would update the action item in DynamoDB
+        # In a real implementation, you would update the action item in MongoDB
         # For now, return success
         
         return {"message": "Action item updated successfully"}
@@ -1139,7 +1139,7 @@ async def get_meeting_config():
 @router.put("/config", response_model=MeetingConfig)
 async def update_meeting_config(
     config: MeetingConfig,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """Update meeting agent configuration."""
     try:
@@ -1209,7 +1209,7 @@ async def stop_meeting_scheduler():
 async def log_bot_event(
     request: dict,
     background_tasks: BackgroundTasks,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Log bot events (join, leave, error, etc.) to the backend.
@@ -1279,7 +1279,7 @@ async def get_general_bot_status():
 @router.get("/bot-status/{meeting_id}")
 async def get_bot_status(
     meeting_id: str,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Get the current status of bots for a specific meeting.
@@ -1347,7 +1347,7 @@ async def send_meeting_invitation(
     meeting_id: str,
     email: str,
     background_tasks: BackgroundTasks,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Send meeting invitation via email.
@@ -1399,7 +1399,7 @@ async def send_meeting_invitation(
 @router.get("/{meeting_id}/invitations")
 async def get_meeting_invitations(
     meeting_id: str,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Get list of invitations sent for a meeting.
@@ -1430,7 +1430,7 @@ async def get_meeting_invitations(
 async def join_meeting_as_participant(
     meeting_id: str,
     request: ParticipantJoinRequest,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Join a meeting as a participant.
@@ -1506,7 +1506,7 @@ async def join_meeting_as_participant(
 async def leave_meeting_as_participant(
     meeting_id: str,
     participant_id: str,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Leave a meeting as a participant.
@@ -1559,7 +1559,7 @@ async def leave_meeting_as_participant(
 @router.get("/{meeting_id}/participants")
 async def get_meeting_participants(
     meeting_id: str,
-    dao: DynamoDBDAO = Depends(get_dao)
+    dao: MongoDBDAO = Depends(get_dao)
 ):
     """
     Get list of current participants in a meeting.

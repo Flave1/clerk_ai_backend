@@ -28,12 +28,19 @@ env.example
 clerk_demo_calender_secrets.json
 *_token.json
 google_calendar_token.json
+secrets-access-policy.json
+waiting_list.json
 
 # Testing
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
 
 # IDEs
 .vscode/
@@ -52,12 +59,16 @@ dist/
 build/
 *.egg-info/
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
 # Database
 *.db
 *.sqlite3
+# MongoDB (local data)
+data/db/
+mongodb-data/
+# Redis (local data)
+redis-data/
+dump.rdb
 
 # Terraform
 infra/terraform/.terraform/
@@ -73,6 +84,10 @@ infra/terraform/.terraform.lock.hcl
 *.bak
 .cache/
 
+# Docker volumes (local data)
+docker-volumes/
+volumes/
+
 # AWS
 .aws/
 
@@ -83,3 +98,27 @@ ecs-task-def.json
 all.txt
 command.md
 
+# Python type checking
+.pytype/
+pytype_output/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OS-specific (additional patterns)
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python package metadata
+*.egg
+*.egg-info/
+.eggs/
+
+# Local development files
+*.local
+local/
+dev/
