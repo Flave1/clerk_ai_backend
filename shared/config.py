@@ -34,8 +34,8 @@ class Settings(BaseSettings):
 
     # AWS Configuration (Optional - for other AWS services)
     aws_region: str = Field("us-east-1", env="AWS_REGION")  # Default to us-east-1
-    aws_access_key_id: Optional[str] = Field("AKIAYSAA7FLJBBJVGB7U", env="AWS_ACCESS_KEY_ID")
-    aws_secret_access_key: Optional[str] = Field("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", env="AWS_SECRET_ACCESS_KEY")
+    aws_access_key_id: Optional[str] = Field(None, env="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: Optional[str] = Field(None, env="AWS_SECRET_ACCESS_KEY")
 
     # MongoDB Configuration
     mongodb_url: str = Field(
@@ -67,9 +67,9 @@ class Settings(BaseSettings):
 
 
     # AI Services
-    openai_api_key: Optional[str] = Field("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", env="OPENAI_API_KEY")
+    openai_api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
     anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
-    elevenlabs_api_key: Optional[str] = Field("sk_09e9eedbc6f49b5cdd0e9c85235f1f7f62cd8984e60f5091", env="ELEVENLABS_API_KEY")
+    elevenlabs_api_key: Optional[str] = Field(None, env="ELEVENLABS_API_KEY")
     deepgram_api_key: Optional[str] = Field(None, env="DEEPGRAM_API_KEY")
 
     # STT/TTS Configuration
@@ -82,9 +82,9 @@ class Settings(BaseSettings):
         None, env="GOOGLE_OAUTH_CLIENT_CONFIG"
     )
 
-    ms_client_id: Optional[str] = Field("2ad3ba05-8462-438f-9957-427b1f5c7b16", env="MS_CLIENT_ID")
-    ms_client_secret: Optional[str] = Field("r2o8Q~Y6ZZY9-TzX.3V8KQ~ScxqvlIT_czcUgc9e", env="MS_CLIENT_SECRET")
-    ms_tenant_id: Optional[str] = Field("common", env="MS_TENANT_ID")
+    ms_client_id: Optional[str] = Field(None, env="MS_CLIENT_ID")
+    ms_client_secret: Optional[str] = Field(None, env="MS_CLIENT_SECRET")
+    ms_tenant_id: Optional[str] = Field(None, env="MS_TENANT_ID")
     
     # Meeting Agent Configuration
     ai_email: Optional[str] = Field(None, env="AI_EMAIL")
@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
     elevenlabs_api_key: Optional[str] = Field(None, env="ELEVENLABS_API_KEY")
     deepgram_api_key: Optional[str] = Field(None, env="DEEPGRAM_API_KEY")
-    aurray_api_key: Optional[str] = Field("sk_live_SCSAwAz3pD-fRJmUQ9qnWIm3vdGgGimSGZ74da3TvFg", env="AURRAY_API_KEY")
+    aurray_api_key: Optional[str] = Field(None, env="AURRAY_API_KEY")
 
     # STT/TTS Configuration
     default_voice_id: str = "f5HLTX707KIM4SzJYzSz"
@@ -149,9 +149,9 @@ class Settings(BaseSettings):
     google_oauth_client_config: Optional[str] = Field(
         None, env="GOOGLE_OAUTH_CLIENT_CONFIG"
     )
-    slack_bot_token: Optional[str] = Field("xoxb-1266716749669-9911008266324-giNAvdXEQ4pTjEyBZ6J7ccH5", env="SLACK_BOT_TOKEN")
-    slack_client_id: Optional[str] = Field("1266716749669.9907403390882", env="SLACK_CLIENT_ID")
-    slack_client_secret: Optional[str] = Field("745c33a2d777dec004a3c0b815f3c2b7", env="SLACK_CLIENT_SECRET")
+    slack_bot_token: Optional[str] = Field(None, env="SLACK_BOT_TOKEN")
+    slack_client_id: Optional[str] = Field(None, env="SLACK_CLIENT_ID")
+    slack_client_secret: Optional[str] = Field(None, env="SLACK_CLIENT_SECRET")
     hubspot_api_key: Optional[str] = Field(None, env="HUBSPOT_API_KEY")
     hubspot_client_id: Optional[str] = Field(None, env="HUBSPOT_CLIENT_ID")
     hubspot_client_secret: Optional[str] = Field(None, env="HUBSPOT_CLIENT_SECRET")
@@ -161,14 +161,14 @@ class Settings(BaseSettings):
     recall_api_key: Optional[str] = Field(None, env="RECALL_API_KEY")
     
     # Meeting Agent OAuth Credentials
-    google_client_id: Optional[str] = Field("748365731205-ppd3v9nm4rs67438ak37sjf0tegiaumr.apps.googleusercontent.com", env="GOOGLE_CLIENT_ID")
-    google_client_secret: Optional[str] = Field("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", env="GOOGLE_CLIENT_SECRET")
+    google_client_id: Optional[str] = Field(None, env="GOOGLE_CLIENT_ID")
+    google_client_secret: Optional[str] = Field(None, env="GOOGLE_CLIENT_SECRET")
     
-    zoom_client_id: Optional[str] = Field("sh25xZ7SCy2WtsBru5Vg", env="ZOOM_CLIENT_ID")
+    zoom_client_id: Optional[str] = Field(None, env="ZOOM_CLIENT_ID")
     zoom_client_secret: Optional[str] = Field(None, env="ZOOM_CLIENT_SECRET")
     zoom_access_token: Optional[str] = Field(None, env="ZOOM_ACCESS_TOKEN")
     zoom_refresh_token: Optional[str] = Field(None, env="ZOOM_REFRESH_TOKEN")
-    zoom_account_id: Optional[str] = Field("uWsUVfKxQCWe_mI1Ee-JZg", env="ZOOM_ACCOUNT_ID")  # For Server-to-Server OAuth
+    zoom_account_id: Optional[str] = Field(None, env="ZOOM_ACCOUNT_ID")  # For Server-to-Server OAuth
     
 
     # Security
